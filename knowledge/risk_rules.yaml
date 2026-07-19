@@ -1,0 +1,159 @@
+version: "1.0.0"
+updated: "2026-07-14"
+
+# === ГЛОБАЛЬНЫЕ ПОРОГИ ===
+thresholds:
+  min_nmck: 100000
+  min_contract_sum: 10000
+  min_margin_percent: 10.0
+  min_margin_siz_percent: 5.0
+  max_cost_to_nmck_ratio: 0.85
+  min_execution_days: 15
+  min_execution_days_large_volume: 30
+
+# === ЗАПРЕЩЁННЫЕ НАПРАВЛЕНИЯ (полный отказ) ===
+forbidden_directions:
+  - name: "Лицензия МЧС на пожарную безопасность"
+    pattern: "лицензия МЧС|МЧС.*пожар|пожарная безопасность.*лицензия"
+    action: "reject"
+    reason: "Нет лицензии МЧС"
+    
+  - name: "Экспертиза промышленной безопасности"
+    pattern: "экспертиза промышленной безопасности|промышленная безопасность.*экспертиза"
+    action: "reject"
+    reason: "Нет аккредитации на экспертизу промбезопасности"
+    
+  - name: "Медицинские работники"
+    pattern: "медицинск.*работник|врач|медсестра|фельдшер"
+    action: "reject"
+    reason: "Не работаем с медицинскими профилями"
+    
+  - name: "Информационная безопасность"
+    pattern: "информационная безопасность|ИБ|кибербезопасность|защита информации"
+    action: "reject"
+    reason: "Нет компетенций в ИБ"
+    
+  - name: "Водительские права"
+    pattern: "водительск.*прав|обучение водител|категория [ABCDEM]"
+    action: "reject"
+    reason: "Не выдаём водительские права"
+    
+  - name: "Гражданская оборона для категорированных"
+    pattern: "гражданская оборона.*категорир|ГО.*категорир"
+    action: "reject"
+    reason: "Не работаем с категорированными организациями по ГО"
+    
+  - name: "Охранники с оружием"
+    pattern: "охранник.*оружи|чоп.*оружие|охрана.*оружие"
+    action: "reject"
+    reason: "Не работаем с охранниками с оружием"
+    
+  - name: "Лицензия ФСБ / гостайна"
+    pattern: "ФСБ|гостайна|секретно|совершенно секретно|допуск.*секрет"
+    action: "reject"
+    reason: "Нет допуска к гостайне"
+    
+  - name: "Исследования воды"
+    pattern: "исследован.*вод|смыв.*вод|вода.*анализ|питьевая вода"
+    action: "reject"
+    reason: "Нет аккредитации на исследования воды"
+    
+  - name: "Смывы"
+    pattern: "смыв|микробиолог|бактериолог|гельминт"
+    action: "reject"
+    reason: "Нет аккредитации на микробиологию"
+    
+  - name: "Яйца гельминтов"
+    pattern: "яйц.*гельминт|гельминт.*яйц"
+    action: "reject"
+    reason: "Нет аккредитации на паразитологию"
+
+# === СМЕШАННЫЕ ЛОТЫ ===
+mixed_lots:
+  rule: "Если в лоте есть хотя бы одна запрещённая программа — не участвуем целиком"
+  exception: "СОУТ + другие услуги — считаем нормальным"
+  iii_subcontractor: "ИИИ (рентген, УЗИ) — есть подрядчик, закладываем стоимость"
+
+# === КРАСНЫЕ ФЛАГИ (риски, но не отказ) ===
+red_flags:
+  - name: "Маржа ниже минимума"
+    condition: "margin_percent < 10"
+    level: "high"
+    message: "Маржа ниже 10% — риск убыточности"
+    
+  - name: "Себестоимость близка к НМЦК"
+    condition: "cost_price / nmck > 0.85"
+    level: "high"
+    message: "Себестоимость > 85% от НМЦК — нет пространства для маржи"
+    
+  - name: "Сжатые сроки"
+    condition: "deadline_days < 15 AND volume_large"
+    level: "medium"
+    message: "Срок исполнения < 15 рабочих дней при большом объёме"
+    
+  - name: "Сверхсжатые сроки"
+    condition: "deadline_days < 5"
+    level: "high"
+    message: "Срок исполнения < 5 дней — критический риск"
+    
+  - name: "НМЦК ниже рынка"
+    condition: "nmck < market_average * 0.7"
+    level: "medium"
+    message: "НМЦК сильно ниже рыночной цены — признак договорняка"
+    
+  - name: "Отдалённый регион"
+    condition: "region_distance > 3000"
+    level: "medium"
+    message: "Выезд в отдалённый регион — высокие транспортные расходы"
+    
+  - name: "Требуется аренда помещения"
+    condition: "venue_required"
+    level: "low"
+    message: "Требуется аренда помещения — доп.расходы 5000-15000₽/день"
+    
+  - name: "История жалоб заказчика"
+    condition: "customer_complaint_rate > 0.3"
+    level: "medium"
+    message: "Заказчик с историей частых жалоб / изменений контракта"
+    
+  - name: "Сложная логистика"
+    condition: "addresses_count > 3"
+    level: "medium"
+    message: "Несколько адресов в разных городах — сложная логистика"
+
+# === РЕКОМЕНДАЦИИ ПО РЕШЕНИЮ ===
+decision_rules:
+  recommended:
+    conditions:
+      - "margin_percent >= 10"
+      - "no_forbidden_directions"
+      - "risk_level != high"
+      - "nmck >= 100000"
+    action: "рекомендуется"
+    
+  reject:
+    conditions:
+      - "has_forbidden_directions"
+      - "margin_percent < 10"
+      - "risk_level == high"
+    action: "не участвуем"
+    
+  submitted:
+    conditions:
+      - "already_submitted"
+    action: "подано"
+
+# === ОГРАНИЧЕНИЯ ПО СУММАМ ===
+price_limits:
+  education:
+    distance_min: 10000
+    full_time_min: 10000
+  sout:
+    min: 20000
+  plk:
+    min: 15000
+  opr:
+    min: 15000
+  supply_siz:
+    max_nmck: 300000
+    min_margin: 5

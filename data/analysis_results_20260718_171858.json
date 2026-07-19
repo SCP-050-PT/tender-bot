@@ -1,0 +1,52 @@
+{
+  "analysis_date": "2026-07-18T17:18:58.700800",
+  "total": 1,
+  "results": [
+    {
+      "tender_id": "32616201721",
+      "tender_type": "oplk",
+      "nmck": 215333.33,
+      "calculated_price": 20000,
+      "recommended_price": 20000,
+      "margin_percent": 85.65,
+      "margin_rub": 9227.0,
+      "cost_price": 10773.0,
+      "risk_level": "high",
+      "decision": "не участвуем",
+      "comment": "Анализ тендера типа «oplk»\n\nРасчётная себестоимость: 10,773 ₽\nРекомендуемая цена: 20,000 ₽\nМаржа: 10.0%\n\nРешение: не участвуем\nУровень риска: high\n\nВыявленные риски:\n• Срок исполнения 0 дней — критический риск",
+      "red_flags": [
+        "Срок исполнения 0 дней — критический риск"
+      ],
+      "transport_cost": 0,
+      "subcontractor_cost": 0,
+      "guarantee_cost": 2000,
+      "details": {
+        "students_count": 0,
+        "certificates": 0,
+        "is_distance": false,
+        "delivery_count": 1,
+        "rm_total": 0,
+        "rm_category_1": 0,
+        "rm_category_2": 0,
+        "iii_count": 0,
+        "is_annual": false,
+        "points_count": 0,
+        "factors_count": 0,
+        "needs_subcontractor": false,
+        "needs_siz_norms": false,
+        "needs_dsiz_norms": false,
+        "needs_iot_norms": false,
+        "deadline_days": 0,
+        "addresses_count": 1,
+        "has_venue": false,
+        "service_name": "oplk",
+        "procurement_method": "zakupki.gov.ru",
+        "tender_url": "https://zakupki.gov.ru/223/purchase/public/purchase/info/common-info.html?regNumber=32616201721",
+        "etp": "",
+        "region": "",
+        "deadline_date": "24.07.2026",
+        "quantity": 0
+      }
+    }
+  ]
+}

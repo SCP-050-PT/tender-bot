@@ -1,0 +1,409 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-07-14",
+  "currency": "RUB",
+  
+  "global_limits": {
+    "min_contract_sum": 10000,
+    "min_nmck": 100000,
+    "min_margin_percent": 10.0,
+    "min_margin_siz_percent": 5.0,
+    "max_tender_preparation_hours": 3,
+    "tender_specialist_rate_per_hour": 100
+  },
+
+  "education": {
+    "documents": {
+      "certificate": {
+        "name": "Удостоверение (корочка)",
+        "cost": 60,
+        "unit": "шт"
+      },
+      "diploma": {
+        "name": "Диплом специалиста (переподготовка)",
+        "cost": 265,
+        "unit": "шт"
+      },
+      "certificate_worker": {
+        "name": "Свидетельство рабочей профессии",
+        "cost": 80,
+        "unit": "шт"
+      },
+      "certificate_qualification": {
+        "name": "Свидетельство повышения квалификации специалистов",
+        "cost": 130,
+        "unit": "шт"
+      },
+      "protocol": {
+        "name": "Протокол по охране труда",
+        "cost": 0,
+        "unit": "шт",
+        "note": "Входит в стоимость, отдельно не выдается"
+      }
+    },
+    "materials": {
+      "paper_a4": {
+        "cost": 1.15,
+        "unit": "лист"
+      },
+      "ink_per_page": {
+        "cost": 2.5,
+        "unit": "лист"
+      },
+      "lamination": {
+        "cost": 10,
+        "unit": "шт",
+        "note": "Только для удостоверений"
+      }
+    },
+    "labor": {
+      "methodist_hour": {
+        "cost": 227,
+        "unit": "час",
+        "note": "В формуле учитывается 3 часа работы методиста"
+      },
+      "ro_hour": {
+        "name": "Час работы РО (руководителя образовательной организации)",
+        "cost": 600,
+        "unit": "час"
+      },
+      "portal_access": {
+        "cost": 57,
+        "unit": "услуга"
+      }
+    },
+    "delivery": {
+      "post_russia": {
+        "cost": 300,
+        "unit": "отправка",
+        "note": "Базовая стоимость, уточнять по весу"
+      }
+    },
+    "overhead": {
+      "base": {
+        "cost": 100,
+        "unit": "услуга",
+        "note": "Базовые накладные расходы"
+      }
+    },
+    "minimum_price": {
+      "distance": 10000,
+      "unit": "руб"
+    },
+    "forms": {
+      "distance": {
+        "name": "Дистанционное обучение",
+        "has_travel": false
+      },
+      "full_time": {
+        "name": "Очное обучение",
+        "has_travel": true,
+        "daily_teacher_rate_min": 4000,
+        "daily_teacher_rate_max": 12000,
+        "accommodation_per_night": 2500,
+        "accommodation_range": [1600, 4000],
+        "fuel_cost_per_km": 5,
+        "manikin_rent_per_day": [2000, 4000],
+        "manikin_purchase": [3000, 10000],
+        "venue_rent_per_day": [5000, 15000],
+        "daily_allowance": 1000
+      }
+    }
+  },
+
+  "sout": {
+    "base_cost_per_rm": {
+      "low_volume": 213.0,
+      "high_volume": 337.5,
+      "note": "Зависит от объёма и сложности"
+    },
+    "materials": {
+      "paper_a4": {
+        "cost": 1.15,
+        "unit": "лист",
+        "default_quantity": 20
+      },
+      "ink_per_page": {
+        "cost": 2.5,
+        "unit": "лист",
+        "default_quantity": 20
+      }
+    },
+    "labor": {
+      "expert_per_rm": {
+        "cost": 90,
+        "unit": "РМ",
+        "note": "Базовая ставка эксперта"
+      },
+      "expert_per_rm_high": {
+        "cost": 214.5,
+        "unit": "РМ",
+        "note": "Повышенная ставка"
+      },
+      "measurer_per_rm": {
+        "cost": 50,
+        "unit": "РМ"
+      },
+      "expert_fixed": {
+        "cost": 3600,
+        "unit": "услуга",
+        "note": "Фиксированная стоимость работы эксперта"
+      }
+    },
+    "delivery": {
+      "post_russia": {
+        "cost": 500,
+        "unit": "отправка",
+        "note": "Базовая стоимость"
+      },
+      "post_russia_high": {
+        "cost": 1000,
+        "unit": "отправка",
+        "note": "Для больших объёмов"
+      }
+    },
+    "iii_subcontractor": {
+      "name": "ИИИ (ионизирующие излучения) — субподряд",
+      "ranges": [
+        {"max_rm": 10, "cost": 5000},
+        {"max_rm": 15, "cost": 6000},
+        {"max_rm": 20, "cost": 7000}
+      ],
+      "note": "Если РМ с ИИИ > 20, увеличить сумму на субподряд"
+    },
+    "calculation_variants": {
+      "variant_1": {
+        "name": "20% основных РМ + аналогия полностью",
+        "description": "20% РМ считаются по полной стоимости, остальные — аналогия"
+      },
+      "variant_2": {
+        "name": "1 карта + остаток из аналогии",
+        "description": "1 полная карта + остальное аналогия"
+      },
+      "variant_3": {
+        "name": "Кол-во карт + комплекты протоколов (20%)",
+        "description": "Карты по категориям + 20% комплектов протоколов, минимум 2 РМ"
+      }
+    },
+    "category_rates": {
+      "1": {
+        "full_cost": 900,
+        "card_cost": 1500,
+        "analogy_cost": 100
+      },
+      "2": {
+        "full_cost": 1800,
+        "card_cost": 2000,
+        "analogy_cost": 100
+      }
+    },
+    "analogy_protocol_set": {
+      "cost": 1000,
+      "unit": "комплект",
+      "min_rm": 2,
+      "note": "20% от аналогичных РМ, но не менее 2 РМ"
+    },
+    "travel": {
+      "fuel_consumption_l_per_100km": 11,
+      "fuel_price_per_liter": 55,
+      "accommodation_per_night": 2500,
+      "expert_daily_allowance": 5000,
+      "measurer_daily_rate": 5000,
+      "ticket_search_sites": ["tutu.ru", "yandex.travel"]
+    }
+  },
+
+  "plk": {
+    "base_cost_per_point": {
+      "cost": 41.9,
+      "unit": "точка"
+    },
+    "labor": {
+      "measurer_per_point": {
+        "cost": 20,
+        "unit": "точка"
+      }
+    },
+    "materials": {
+      "paper_a4": {
+        "cost": 1.15,
+        "unit": "лист",
+        "default_quantity": 6
+      },
+      "ink_per_page": {
+        "cost": 2.5,
+        "unit": "лист",
+        "default_quantity": 6
+      }
+    },
+    "delivery": {
+      "post_russia": {
+        "cost": 500,
+        "unit": "отправка"
+      }
+    },
+    "subcontractor": {
+      "default_cost": 10000,
+      "note": "Если факторы вне области аккредитации"
+    },
+    "travel": {
+      "transport_default": 40000,
+      "accommodation_default": 4000,
+      "daily_allowance": 4000
+    },
+    "periodicity": {
+      "one_time": {
+        "name": "Разовый ПЛК",
+        "delivery_count": 1
+      },
+      "annual": {
+        "name": "Годовое обслуживание",
+        "delivery_count": 12,
+        "note": "12 отправок почтой"
+      }
+    }
+  },
+
+  "opr": {
+    "materials": {
+      "paper_a4": {
+        "cost": 1.15,
+        "unit": "лист",
+        "default_quantity": 16
+      },
+      "ink_per_page": {
+        "cost": 2.5,
+        "unit": "лист",
+        "default_quantity": 16
+      }
+    },
+    "labor": {
+      "sot_per_rm": {
+        "name": "СОТ (специальная оценка условий труда)",
+        "cost": 40,
+        "unit": "РМ"
+      },
+      "processing_per_rm": {
+        "name": "Обработка замеров",
+        "cost": 10,
+        "unit": "РМ"
+      },
+      "program_per_day": {
+        "name": "Программа в день",
+        "cost": 10,
+        "unit": "день"
+      }
+    },
+    "additional_documents": {
+      "siz_norms": {
+        "name": "Нормы СИЗ",
+        "formula": "rm_count * 200",
+        "unit": "руб"
+      },
+      "dsiz_norms": {
+        "name": "Нормы ДСИЗ",
+        "formula": "rm_count * 200",
+        "unit": "руб"
+      },
+      "iot_norms": {
+        "name": "ИОТ",
+        "formula": "rm_count * 200",
+        "unit": "руб"
+      }
+    },
+    "margin_percent": 30
+  },
+
+  "guarantees": {
+    "application": {
+      "types": {
+        "tariff": {
+          "name": "Тариф (списывается полностью)",
+          "returnable": false,
+          "note": "Применяется редко, на коммерческих тендерах"
+        },
+        "deposit": {
+          "name": "Депозит (возвращается при проигрыше)",
+          "returnable": true,
+          "note": "Блокируется на спецсчёте"
+        },
+        "special_account": {
+          "name": "Сумма на спецсчёте",
+          "returnable": true,
+          "note": "Списывается только при победе и отказе"
+        },
+        "bank_guarantee": {
+          "name": "Банковская гарантия",
+          "returnable": false,
+          "note": "Предпочтительна при сумме > 5000₽"
+        }
+      },
+      "bank_guarantee_cost": {
+          "ranges": [
+              {"max_contract": 50000, "guarantee_percent": 10, "bg_cost": 1000, "real_cost": 1000},
+              {"max_contract": 100000, "guarantee_percent": 10, "bg_cost": 1200, "real_cost": 1200},
+              {"max_contract": 500000, "guarantee_percent": 10, "bg_cost": 2000, "real_cost": 2000},
+              {"max_contract": 1000000, "guarantee_percent": 10, "bg_cost": 4000, "real_cost": 4000},
+              {"max_contract": 5000000, "guarantee_percent": 10, "bg_cost": 10000, "real_cost": 10000}
+          ]
+      }
+    },
+    "contract": {
+      "percent": 10,
+      "bank_guarantee_preferred": true,
+      "threshold": 5000
+    }
+  },
+
+  "travel": {
+    "fuel": {
+      "consumption_l_per_100km": 11,
+      "price_per_liter": 55
+    },
+    "accommodation": {
+      "standard_per_night": 2500,
+      "range": [1600, 4000]
+    },
+    "daily_allowance": {
+      "standard": 500,
+      "education_full_time": 1000
+    },
+    "ticket_search": {
+      "sites": ["tutu.ru", "yandex.travel"],
+      "note": "Экономичные билеты с багажом"
+    },
+    "sout_expert_daily": 5000,
+    "education_teacher_daily_min": 4000,
+    "education_teacher_daily_max": 12000
+  },
+
+  "etp_commission": {
+    "note": "Комиссия электронной торговой площадки — учитывать индивидуально",
+    "typical_range": [0.5, 1.5],
+    "unit": "percent"
+  },
+
+  "urgency_multiplier": {
+    "description": "Если сроки сжатые (до 2 недель, до 5 дней)",
+    "recommendation": "Увеличить накладные расходы вручную",
+    "note": "Множитель определяется индивидуально"
+  },
+
+  "print_reports_sout": {
+    "documents": [
+      {"name": "Титульный лист", "quantity": 1},
+      {"name": "Сведения об организации", "quantity": 1},
+      {"name": "Копия области аккредитации лаборатории", "quantity": 1},
+      {"name": "Копия по СОУТ аккредитации Минтруда", "quantity": 1},
+      {"name": "Перечень РМ", "quantity": 1},
+      {"name": "Протокол комиссии идентификации", "quantity": 1},
+      {"name": "Сводная ведомость", "quantity": 1},
+      {"name": "Перечень мероприятий", "quantity": 1},
+      {"name": "Сводное заключение", "quantity": 1},
+      {"name": "Сводное заключение (доп)", "quantity": 1},
+      {"name": "Карты", "quantity": "по количеству РМ"},
+      {"name": "Протоколы", "quantity": "по количеству РМ"},
+      {"name": "Декларация", "quantity": 1, "note": "Печатать отдельно, не сшивать"}
+    ]
+  }
+}
