@@ -1,17 +1,18 @@
 {
-  "version": "1.0.0",
-  "updated": "2026-07-14",
+  "version": "1.6.0",
+  "updated": "2026-07-26",
   "currency": "RUB",
-  
   "global_limits": {
     "min_contract_sum": 10000,
     "min_nmck": 100000,
     "min_margin_percent": 10.0,
     "min_margin_siz_percent": 5.0,
+    "max_cost_to_nmck_ratio": 0.85,
+    "min_execution_days": 15,
+    "min_execution_days_large_volume": 30,
     "max_tender_preparation_hours": 3,
     "tender_specialist_rate_per_hour": 100
   },
-
   "education": {
     "documents": {
       "certificate": {
@@ -88,6 +89,7 @@
     },
     "minimum_price": {
       "distance": 10000,
+      "full_time": 10000,
       "unit": "руб"
     },
     "forms": {
@@ -101,90 +103,42 @@
         "daily_teacher_rate_min": 4000,
         "daily_teacher_rate_max": 12000,
         "accommodation_per_night": 2500,
-        "accommodation_range": [1600, 4000],
+        "accommodation_range": [
+          1600,
+          4000
+        ],
         "fuel_cost_per_km": 5,
-        "manikin_rent_per_day": [2000, 4000],
-        "manikin_purchase": [3000, 10000],
-        "venue_rent_per_day": [5000, 15000],
         "daily_allowance": 1000
+      }
+    },
+    "rates": {
+      "teacher_daily": {
+        "cost": 8000,
+        "unit": "день",
+        "note": "Ставка преподавателя за день (из ТЗ, не авто)"
+      },
+      "manikin_daily": {
+        "cost": 15000,
+        "unit": "день",
+        "note": "Аренда манекена/тренажёра (из ТЗ, не авто)"
+      },
+      "venue_daily": {
+        "cost": 3000,
+        "unit": "день",
+        "note": "Аренда помещения (из ТЗ, не авто)"
+      },
+      "transport_fixed": {
+        "cost": 10000,
+        "unit": "выезд",
+        "range": [
+          5000,
+          15000
+        ],
+        "note": "Fallback при transport_km=0 для очного обучения"
       }
     }
   },
-
   "sout": {
-    "base_cost_per_rm": {
-      "low_volume": 213.0,
-      "high_volume": 337.5,
-      "note": "Зависит от объёма и сложности"
-    },
-    "materials": {
-      "paper_a4": {
-        "cost": 1.15,
-        "unit": "лист",
-        "default_quantity": 20
-      },
-      "ink_per_page": {
-        "cost": 2.5,
-        "unit": "лист",
-        "default_quantity": 20
-      }
-    },
-    "labor": {
-      "expert_per_rm": {
-        "cost": 90,
-        "unit": "РМ",
-        "note": "Базовая ставка эксперта"
-      },
-      "expert_per_rm_high": {
-        "cost": 214.5,
-        "unit": "РМ",
-        "note": "Повышенная ставка"
-      },
-      "measurer_per_rm": {
-        "cost": 50,
-        "unit": "РМ"
-      },
-      "expert_fixed": {
-        "cost": 3600,
-        "unit": "услуга",
-        "note": "Фиксированная стоимость работы эксперта"
-      }
-    },
-    "delivery": {
-      "post_russia": {
-        "cost": 500,
-        "unit": "отправка",
-        "note": "Базовая стоимость"
-      },
-      "post_russia_high": {
-        "cost": 1000,
-        "unit": "отправка",
-        "note": "Для больших объёмов"
-      }
-    },
-    "iii_subcontractor": {
-      "name": "ИИИ (ионизирующие излучения) — субподряд",
-      "ranges": [
-        {"max_rm": 10, "cost": 5000},
-        {"max_rm": 15, "cost": 6000},
-        {"max_rm": 20, "cost": 7000}
-      ],
-      "note": "Если РМ с ИИИ > 20, увеличить сумму на субподряд"
-    },
-    "calculation_variants": {
-      "variant_1": {
-        "name": "20% основных РМ + аналогия полностью",
-        "description": "20% РМ считаются по полной стоимости, остальные — аналогия"
-      },
-      "variant_2": {
-        "name": "1 карта + остаток из аналогии",
-        "description": "1 полная карта + остальное аналогия"
-      },
-      "variant_3": {
-        "name": "Кол-во карт + комплекты протоколов (20%)",
-        "description": "Карты по категориям + 20% комплектов протоколов, минимум 2 РМ"
-      }
-    },
     "category_rates": {
       "1": {
         "full_cost": 900,
@@ -203,16 +157,97 @@
       "min_rm": 2,
       "note": "20% от аналогичных РМ, но не менее 2 РМ"
     },
+    "materials": {
+      "paper_a4": {
+        "cost": 1.15,
+        "unit": "лист",
+        "default_quantity": 20
+      },
+      "ink_per_page": {
+        "cost": 2.5,
+        "unit": "лист",
+        "default_quantity": 20
+      }
+    },
+    "labor": {
+      "expert_per_rm": {
+        "cost": 90,
+        "unit": "РМ",
+        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента. Используется только для справки, не в расчёте цены"
+      },
+      "expert_per_rm_high": {
+        "cost": 214.5,
+        "unit": "РМ",
+        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента. Используется только для справки, не в расчёте цены"
+      },
+      "measurer_per_rm": {
+        "cost": 50,
+        "unit": "РМ",
+        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента"
+      },
+      "expert_fixed": {
+        "cost": 3600,
+        "unit": "услуга",
+        "note": "СЕБЕСТОИМОСТЬ — не входит в цену клиента"
+      }
+    },
+    "delivery": {
+      "post_russia": {
+        "cost": 500,
+        "unit": "отправка",
+        "note": "Базовая стоимость"
+      },
+      "post_russia_high": {
+        "cost": 1000,
+        "unit": "отправка",
+        "note": "Для больших объёмов"
+      }
+    },
+    "iii_subcontractor": {
+      "name": "ИИИ (ионизирующие излучения) — субподряд",
+      "ranges": [
+        {
+          "max_rm": 10,
+          "cost": 5000
+        },
+        {
+          "max_rm": 15,
+          "cost": 6000
+        },
+        {
+          "max_rm": 20,
+          "cost": 7000
+        }
+      ],
+      "note": "Если РМ с ИИИ > 20, увеличить сумму на субподряд"
+    },
+    "calculation_variants": {
+      "variant_1": {
+        "name": "20% основных РМ + аналогия полностью",
+        "description": "20% РМ считаются по полной стоимости категорий, остальные — аналогия 100₽/РМ"
+      },
+      "variant_2": {
+        "name": "1 карта + остаток из аналогии",
+        "description": "Карты по категориям (1500/2000) + остальное аналогия 200₽/РМ"
+      },
+      "variant_3": {
+        "name": "Кол-во карт + комплекты протоколов (20%)",
+        "description": "Карты по категориям (1500/2000) + 20% комплектов протоколов (1000₽), минимум 2 РМ"
+      }
+    },
     "travel": {
-      "fuel_consumption_l_per_100km": 11,
-      "fuel_price_per_liter": 55,
+      "fixed_trip_cost": 12000,
+      "trip_days_default": 3,
+      "daily_allowance": 500,
       "accommodation_per_night": 2500,
-      "expert_daily_allowance": 5000,
       "measurer_daily_rate": 5000,
-      "ticket_search_sites": ["tutu.ru", "yandex.travel"]
+      "seasonal_multiplier": 2,
+      "cities_count": {
+        "note": "Уникальные города (не адреса). Выезды считаются по городам"
+      },
+      "note": "Формула Александры: cities_count × 12000 + trip_days × (500 + 2500 + 5000). При сезонности: выезды ×2 (например, 1 город → 2, 3 города → 6)"
     }
   },
-
   "plk": {
     "base_cost_per_point": {
       "cost": 41.9,
@@ -263,8 +298,19 @@
       }
     }
   },
-
   "opr": {
+    "rates": {
+      "per_position": {
+        "cost": 500,
+        "unit": "должность",
+        "note": "Оценка профессиональных рисков по должностям"
+      },
+      "per_person": {
+        "cost": 150,
+        "unit": "человек",
+        "note": "Оценка профессиональных рисков по численности"
+      }
+    },
     "materials": {
       "paper_a4": {
         "cost": 1.15,
@@ -311,9 +357,14 @@
         "unit": "руб"
       }
     },
+    "delivery": {
+      "post_russia": {
+        "cost": 1000,
+        "unit": "отправка"
+      }
+    },
     "margin_percent": 30
   },
-
   "guarantees": {
     "application": {
       "types": {
@@ -339,13 +390,38 @@
         }
       },
       "bank_guarantee_cost": {
-          "ranges": [
-              {"max_contract": 50000, "guarantee_percent": 10, "bg_cost": 1000, "real_cost": 1000},
-              {"max_contract": 100000, "guarantee_percent": 10, "bg_cost": 1200, "real_cost": 1200},
-              {"max_contract": 500000, "guarantee_percent": 10, "bg_cost": 2000, "real_cost": 2000},
-              {"max_contract": 1000000, "guarantee_percent": 10, "bg_cost": 4000, "real_cost": 4000},
-              {"max_contract": 5000000, "guarantee_percent": 10, "bg_cost": 10000, "real_cost": 10000}
-          ]
+        "ranges": [
+          {
+            "max_contract": 50000,
+            "guarantee_percent": 10,
+            "bg_cost": 1000,
+            "real_cost": 1000
+          },
+          {
+            "max_contract": 100000,
+            "guarantee_percent": 10,
+            "bg_cost": 1200,
+            "real_cost": 1200
+          },
+          {
+            "max_contract": 500000,
+            "guarantee_percent": 10,
+            "bg_cost": 2000,
+            "real_cost": 2000
+          },
+          {
+            "max_contract": 1000000,
+            "guarantee_percent": 10,
+            "bg_cost": 4000,
+            "real_cost": 4000
+          },
+          {
+            "max_contract": 5000000,
+            "guarantee_percent": 10,
+            "bg_cost": 10000,
+            "real_cost": 10000
+          }
+        ]
       }
     },
     "contract": {
@@ -354,56 +430,101 @@
       "threshold": 5000
     }
   },
-
   "travel": {
     "fuel": {
       "consumption_l_per_100km": 11,
-      "price_per_liter": 55
+      "price_per_liter": 65
     },
     "accommodation": {
       "standard_per_night": 2500,
-      "range": [1600, 4000]
+      "range": [
+        1600,
+        4000
+      ]
     },
     "daily_allowance": {
       "standard": 500,
       "education_full_time": 1000
     },
     "ticket_search": {
-      "sites": ["tutu.ru", "yandex.travel"],
+      "sites": [
+        "tutu.ru",
+        "yandex.travel"
+      ],
       "note": "Экономичные билеты с багажом"
     },
     "sout_expert_daily": 5000,
     "education_teacher_daily_min": 4000,
     "education_teacher_daily_max": 12000
   },
-
   "etp_commission": {
     "note": "Комиссия электронной торговой площадки — учитывать индивидуально",
-    "typical_range": [0.5, 1.5],
+    "typical_range": [
+      0.5,
+      1.5
+    ],
     "unit": "percent"
   },
-
   "urgency_multiplier": {
     "description": "Если сроки сжатые (до 2 недель, до 5 дней)",
     "recommendation": "Увеличить накладные расходы вручную",
     "note": "Множитель определяется индивидуально"
   },
-
   "print_reports_sout": {
     "documents": [
-      {"name": "Титульный лист", "quantity": 1},
-      {"name": "Сведения об организации", "quantity": 1},
-      {"name": "Копия области аккредитации лаборатории", "quantity": 1},
-      {"name": "Копия по СОУТ аккредитации Минтруда", "quantity": 1},
-      {"name": "Перечень РМ", "quantity": 1},
-      {"name": "Протокол комиссии идентификации", "quantity": 1},
-      {"name": "Сводная ведомость", "quantity": 1},
-      {"name": "Перечень мероприятий", "quantity": 1},
-      {"name": "Сводное заключение", "quantity": 1},
-      {"name": "Сводное заключение (доп)", "quantity": 1},
-      {"name": "Карты", "quantity": "по количеству РМ"},
-      {"name": "Протоколы", "quantity": "по количеству РМ"},
-      {"name": "Декларация", "quantity": 1, "note": "Печатать отдельно, не сшивать"}
+      {
+        "name": "Титульный лист",
+        "quantity": 1
+      },
+      {
+        "name": "Сведения об организации",
+        "quantity": 1
+      },
+      {
+        "name": "Копия области аккредитации лаборатории",
+        "quantity": 1
+      },
+      {
+        "name": "Копия по СОУТ аккредитации Минтруда",
+        "quantity": 1
+      },
+      {
+        "name": "Перечень РМ",
+        "quantity": 1
+      },
+      {
+        "name": "Протокол комиссии идентификации",
+        "quantity": 1
+      },
+      {
+        "name": "Сводная ведомость",
+        "quantity": 1
+      },
+      {
+        "name": "Перечень мероприятий",
+        "quantity": 1
+      },
+      {
+        "name": "Сводное заключение",
+        "quantity": 1
+      },
+      {
+        "name": "Сводное заключение (доп)",
+        "quantity": 1
+      },
+      {
+        "name": "Карты",
+        "quantity": "по количеству РМ"
+      },
+      {
+        "name": "Протоколы",
+        "quantity": "по количеству РМ"
+      },
+      {
+        "name": "Декларация",
+        "quantity": 1,
+        "note": "Печатать отдельно, не сшивать"
+      }
     ]
   }
 }

@@ -1,9 +1,12 @@
 """
 core/google_sheets.py
 Работа с Google Sheets. Чтение, запись, проверка дубликатов, форматирование.
+Версия: v6.0 (26.07.2026) — исправлена опечатка "Способо", расширен диапазон A:T,
+добавлены колонки needs_manual_review, llm_confidence.
 """
 
 import json
+import traceback
 from pathlib import Path
 from typing import Optional, List, Dict
 from dataclasses import dataclass
@@ -21,29 +24,37 @@ except ImportError:
 
 from config.settings import settings
 
-# Стандартные колонки таблицы заказчицы
+# === СТРУКТУРА ЛИСТА "Тендера 2026 ИИ-бот" ===
+# ← v6.0: Исправлена опечатка "Способо" → "Способ", добавлены колонки S, T
 SHEET_COLUMNS = [
-    "Наименование услуг",
-    "Количество",
-    "Способ проведения закупки",
-    "НМЦК",
-    "Ссылка на тендер",
-    "ЭТП",
-    "Регион",
-    "Обеспечение заявки",
-    "Обеспечение контракта",
-    "Срок подачи заявки до",
-    "Решение по участию",
-    "Цена предложения",
-    "Результат",
-    "Комментарии руководителя отдела по участию",
+    "ID тендера",  # A
+    "Наименование услуг",  # B
+    "Количество",  # C
+    "Способ проведения закупки",  # D
+    "НМЦК",  # E
+    "Ссылка на тендер",  # F
+    "ЭТП",  # G
+    "Регион",  # H
+    "Обеспечение заявки",  # I
+    "Обеспечение контракта",  # J
+    "Способ обеспечения исполнения",  # K ← v6.0: исправлена опечатка
+    "Срок подачи заявки до",  # L
+    "Решение по участию",  # M
+    "Цена предложения",  # N
+    "Результат",  # O
+    "Дата заключения контракта",  # P
+    "Дата выполнения работ",  # Q
+    "Комментарии руководителя отдела по участию",  # R
+    "Ручная проверка",  # S ← v6.0
+    "Уверенность ИИ",  # T ← v6.0
 ]
+
+# ← v6.0: Расширен диапазон с A:N до A:T (20 колонок)
+BOT_COLUMNS_RANGE = "A:T"
 
 
 @dataclass
 class TenderRecord:
-    """Запись о тендере в таблице."""
-
     row_number: int
     tender_id: Optional[str]
     service_name: str
@@ -53,15 +64,10 @@ class TenderRecord:
     comment: str
 
     def is_duplicate_of(self, tender_id: str) -> bool:
-        """Проверяет, является ли запись дубликатом."""
         return self.tender_id == tender_id
 
 
 class GoogleSheetsManager:
-    """
-    Менеджер для работы с Google Sheets.
-    """
-
     SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
@@ -71,10 +77,16 @@ class GoogleSheetsManager:
         self,
         spreadsheet_id: Optional[str] = None,
         credentials_path: Optional[str] = None,
+        worksheet_name: Optional[str] = None,
     ):
-        self.spreadsheet_id = spreadsheet_id or settings.GOOGLE_SHEETS_ID
-        self.credentials_path = (
-            credentials_path or settings.GOOGLE_SHEETS_CREDENTIALS_PATH
+        self.spreadsheet_id = spreadsheet_id or getattr(
+            settings, "GOOGLE_SHEETS_ID", None
+        )
+        self.credentials_path = credentials_path or getattr(
+            settings, "GOOGLE_SHEETS_CREDENTIALS_PATH", "./config/credentials.json"
+        )
+        self.worksheet_name = worksheet_name or getattr(
+            settings, "GOOGLE_SHEETS_WORKSHEET", "Тендера 2026 ИИ-бот"
         )
         self.client = None
         self.sheet = None
@@ -85,190 +97,210 @@ class GoogleSheetsManager:
                 "gspread не установлен. Установите: pip install gspread google-auth"
             )
 
+        if not self.spreadsheet_id:
+            raise ValueError("GOOGLE_SHEETS_ID не задан в .env или settings")
+
         self._connect()
 
-    def _connect(self):
-        """Устанавливает соединение с Google Sheets."""
-        try:
-            creds_path = Path(self.credentials_path)
-            if not creds_path.exists():
-                logger.error(f"Файл credentials не найден: {self.credentials_path}")
-                raise FileNotFoundError(
-                    f"Credentials not found: {self.credentials_path}"
-                )
+    def _validate_credentials(self) -> tuple[bool, str]:
+        """
+        Проверяет файл credentials перед подключением.
+        Возвращает (ok, message).
+        """
+        creds_path = Path(self.credentials_path)
 
+        # 1. Проверка существования файла
+        if not creds_path.exists():
+            return False, f"Файл credentials НЕ НАЙДЕН: {creds_path.absolute()}"
+
+        # 2. Проверка что это JSON
+        try:
+            with open(creds_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except json.JSONDecodeError as e:
+            return False, f"Файл credentials не является валидным JSON: {e}"
+        except Exception as e:
+            return False, f"Ошибка чтения credentials: {e}"
+
+        # 3. Проверка обязательных полей
+        required_fields = ["private_key", "client_email", "token_uri"]
+        missing = [f for f in required_fields if f not in data or not data[f]]
+        if missing:
+            return False, (
+                f"В credentials.json ОТСУТСТВУЮТ обязательные поля: {missing}. "
+                f"Убедитесь, что вы скачали ПОЛНЫЙ JSON-ключ из Google Cloud Console."
+            )
+
+        # 4. Проверка что private_key не пустой
+        if len(data["private_key"]) < 100:
+            return False, "private_key слишком короткий — возможно, файл повреждён"
+
+        # 5. Проверка client_email
+        if "@" not in data.get("client_email", ""):
+            return False, "client_email невалиден"
+
+        return True, "OK"
+
+    def _connect(self):
+        """Устанавливает соединение с Google Sheets с детальным логированием."""
+        try:
+            # Шаг 1: Валидация credentials
+            logger.info(f"🔐 Проверка credentials: {self.credentials_path}")
+            ok, msg = self._validate_credentials()
+            if not ok:
+                logger.error(f"❌ {msg}")
+                raise ValueError(msg)
+            logger.info("✅ Credentials валидны")
+
+            # Шаг 2: Загрузка credentials
+            creds_path = Path(self.credentials_path)
             credentials = Credentials.from_service_account_file(
                 str(creds_path), scopes=self.SCOPES
             )
+            logger.info(
+                f"✅ Credentials загружены: {credentials.service_account_email}"
+            )
 
+            # Шаг 3: Авторизация
             self.client = gspread.authorize(credentials)
-            self.sheet = self.client.open_by_key(self.spreadsheet_id)
-            self.worksheet = self.sheet.sheet1  # Первый лист (gid=0)
+            logger.info("✅ Авторизация gspread успешна")
 
-            logger.info(f"Подключено к таблице: {self.spreadsheet_id}")
+            # Шаг 4: Открытие таблицы
+            logger.info(f"🔓 Открытие таблицы: {self.spreadsheet_id}")
+            self.sheet = self.client.open_by_key(self.spreadsheet_id)
+            logger.info(f"✅ Таблица открыта: {self.sheet.title}")
+
+            # Шаг 5: Подключение к листу
+            logger.info(f'📄 Поиск листа: "{self.worksheet_name}"')
+            available_sheets = [w.title for w in self.sheet.worksheets()]
+            logger.info(f"   Доступные листы: {available_sheets}")
+
+            try:
+                self.worksheet = self.sheet.worksheet(self.worksheet_name)
+            except gspread.WorksheetNotFound:
+                error_msg = (
+                    f'Лист "{self.worksheet_name}" НЕ НАЙДЕН. '
+                    f"Доступные: {available_sheets}"
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+
+            logger.info(
+                f'📊 Подключено к листу "{self.worksheet_name}" '
+                f"(строк: {self.worksheet.row_count}, колонок: {self.worksheet.col_count})"
+            )
 
         except Exception as e:
-            logger.error(f"Ошибка подключения к Google Sheets: {e}")
+            # Детальный вывод ошибки с traceback
+            error_msg = (
+                f"Ошибка подключения к Google Sheets: {type(e).__name__}: {str(e)}"
+            )
+            logger.error(error_msg)
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
             raise
 
-    def get_all_records(self) -> List[Dict]:
-        """Получает все записи из таблицы."""
-        try:
-            records = self.worksheet.get_all_records()
-            logger.info(f"Получено {len(records)} записей из таблицы")
-            return records
-        except Exception as e:
-            logger.error(f"Ошибка чтения таблицы: {e}")
-            return []
-
     def find_duplicate(self, tender_id: str) -> Optional[int]:
-        """
-        Ищет дубликат тендера по ID.
-
-        Returns:
-            int: Номер строки (1-based) или None
-        """
-        try:
-            # Ищем в колонке "Ссылка на тендер" или первой колонке
-            all_values = self.worksheet.get_all_values()
-
-            for i, row in enumerate(all_values[1:], start=2):  # Пропускаем заголовок
-                # Проверяем, содержит ли строка ID тендера
-                row_text = " ".join(row)
-                if tender_id in row_text:
-                    logger.info(f"Найден дубликат тендера {tender_id} в строке {i}")
-                    return i
-
+        if not tender_id:
             return None
-
+        try:
+            col_a = self.worksheet.col_values(1)
+            for i, val in enumerate(col_a[1:], start=2):
+                if str(tender_id) in str(val):
+                    logger.info(f"Найден дубликат {tender_id} в строке {i}")
+                    return i
+            return None
         except Exception as e:
             logger.error(f"Ошибка поиска дубликата: {e}")
             return None
 
-    def add_tender(self, data: Dict, check_duplicate: bool = True) -> bool:
-        """
-        Добавляет тендер в таблицу.
-
-        Args:
-            data: Словарь с данными тендера (соответствует SHEET_COLUMNS)
-            check_duplicate: Проверять ли дубликаты
-
-        Returns:
-            bool: Успешно ли добавлено
-        """
-        try:
-            tender_id = data.get("Ссылка на тендер", "")
-
-            # Проверка дубликата
-            if check_duplicate and tender_id:
-                existing_row = self.find_duplicate(tender_id)
-                if existing_row:
-                    logger.info(
-                        f"Тендер {tender_id} уже есть в таблице (строка {existing_row})"
-                    )
-                    return False
-
-            # Формируем строку в правильном порядке
-            row = [data.get(col, "") for col in SHEET_COLUMNS]
-
-            # Добавляем в конец
-            self.worksheet.append_row(row, value_input_option="USER_ENTERED")
-
-            # Форматирование по решению
-            decision = data.get("Решение по участию", "")
-            if decision == "не участвуем":
-                self._format_row_red(len(self.worksheet.get_all_values()))
-            elif decision == "рекомендуется":
-                self._format_row_green(len(self.worksheet.get_all_values()))
-
-            logger.info(
-                f"Тендер добавлен в таблицу: {data.get('Наименование услуг', 'N/A')}"
-            )
-            return True
-
-        except Exception as e:
-            logger.error(f"Ошибка добавления тендера: {e}")
-            return False
-
     def add_tender_to_top(self, data: Dict, check_duplicate: bool = True) -> bool:
-        """
-        Добавляет тендер в начало таблицы (новые сверху).
-        """
         try:
-            tender_id = data.get("Ссылка на тендер", "")
+            tender_id = data.get("ID тендера", "")
 
             if check_duplicate and tender_id:
                 existing_row = self.find_duplicate(tender_id)
                 if existing_row:
-                    logger.info(f"Тендер {tender_id} уже есть в таблице")
+                    logger.info(f"Тендер {tender_id} уже есть (строка {existing_row})")
                     return False
 
-            # Получаем текущие данные
-            all_values = self.worksheet.get_all_values()
-
-            # Формируем новую строку
             row = [data.get(col, "") for col in SHEET_COLUMNS]
-
-            # Вставляем после заголовка (строка 2)
             self.worksheet.insert_row(row, index=2, value_input_option="USER_ENTERED")
 
-            # Форматирование
             decision = data.get("Решение по участию", "")
             if decision == "не участвуем":
                 self._format_row_red(2)
             elif decision == "рекомендуется":
                 self._format_row_green(2)
 
-            logger.info(f"Тендер добавлен в начало таблицы")
+            logger.info(f'✅ Тендер {tender_id} добавлен в "{self.worksheet_name}"')
             return True
 
         except Exception as e:
-            logger.error(f"Ошибка добавления: {e}")
+            logger.error(f"Ошибка добавления тендера: {e}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
             return False
 
     def update_tender(self, row_number: int, data: Dict) -> bool:
-        """Обновляет существующую строку."""
         try:
             row = [data.get(col, "") for col in SHEET_COLUMNS]
-            self.worksheet.update(f"A{row_number}:N{row_number}", [row])
+            # ← v6.0: Динамический расчёт end_col для 20 колонок
+            end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
+            self.worksheet.update(f"A{row_number}:{end_col}{row_number}", [row])
             logger.info(f"Строка {row_number} обновлена")
             return True
         except Exception as e:
             logger.error(f"Ошибка обновления: {e}")
             return False
 
+    # ← v6.0: Вспомогательный метод для конвертации индекса колонки в букву
+    def _col_index_to_letter(self, index: int) -> str:
+        """Конвертирует индекс колонки (1-based) в буквенное обозначение."""
+        result = ""
+        while index > 0:
+            index, remainder = divmod(index - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
+
     def _format_row_red(self, row_number: int):
-        """Закрашивает строку красным (высокий риск / отказ)."""
         try:
+            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:N{row_number}",
+                f"A{row_number}:T{row_number}",
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
         except Exception as e:
-            logger.warning(f"Не удалось применить форматирование: {e}")
+            logger.warning(f"Не удалось применить красное форматирование: {e}")
 
     def _format_row_green(self, row_number: int):
-        """Закрашивает строку зелёным (рекомендуется)."""
         try:
+            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:N{row_number}",
+                f"A{row_number}:T{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
-            logger.warning(f"Не удалось применить форматирование: {e}")
+            logger.warning(f"Не удалось применить зелёное форматирование: {e}")
 
     def _format_row_yellow(self, row_number: int):
-        """Закрашивает строку жёлтым (средний риск)."""
         try:
+            # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:N{row_number}",
+                f"A{row_number}:T{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
-            logger.warning(f"Не удалось применить форматирование: {e}")
+            logger.warning(f"Не удалось применить жёлтое форматирование: {e}")
+
+    def get_all_records(self) -> List[Dict]:
+        try:
+            records = self.worksheet.get_all_records()
+            logger.info(f"Получено {len(records)} записей")
+            return records
+        except Exception as e:
+            logger.error(f"Ошибка чтения таблицы: {e}")
+            return []
 
     def get_last_row_number(self) -> int:
-        """Возвращает номер последней заполненной строки."""
         try:
             return len(self.worksheet.get_all_values())
         except Exception as e:
@@ -276,13 +308,16 @@ class GoogleSheetsManager:
             return 1
 
 
-# Глобальный инстанс (ленивая инициализация)
 _sheets_manager: Optional[GoogleSheetsManager] = None
 
 
 def get_sheets_manager() -> GoogleSheetsManager:
-    """Возвращает менеджер Google Sheets (singleton)."""
     global _sheets_manager
     if _sheets_manager is None:
         _sheets_manager = GoogleSheetsManager()
     return _sheets_manager
+
+
+def reset_sheets_manager():
+    global _sheets_manager
+    _sheets_manager = None

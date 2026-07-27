@@ -1,10 +1,18 @@
 """
 core/calculator.py
-Калькулятор себестоимости и цены предложения для тендеров.
+Калькулятор ЦЕНЫ ДЛЯ КЛИЕНТА (не себестоимости).
 Все формулы взяты из Excel-калькуляторов заказчицы.
+ИСПРАВЛЕНО (26.07.2026 v5.5):
+  - calculate_sout(): addresses_count → cities_count для выездов (БАГ 4.1)
+  - calculate_sout(): замерщик = trip_days × 5000, не × trips (БАГ 4.2)
+  - calculate_sout(): для 1 адреса авто-расчёт выезда (БАГ 4.3)
+  - calculate_education(): teacher_days из ТЗ, не авто ceil/25
+  - calculate_combined(): ОПР считает rm_count (sot + processing)
+  - calculate_education(): минимум 10000 и для очного
 """
 
 import json
+import math
 from pathlib import Path
 from typing import Optional, Literal
 from dataclasses import dataclass
@@ -12,12 +20,12 @@ from loguru import logger
 
 from config.settings import settings
 
-# === ЛЕНИВАЯ ЗАГРУЗКА БАЗЫ СЕБЕСТОИМОСТЕЙ ===
+# === ЛЕНИВАЯ ЗАГРУЗКА БАЗЫ ЦЕН ===
 COSTS: Optional[dict] = None
 
 
 def _load_costs() -> dict:
-    """Ленивая загрузка базы себестоимостей."""
+    """Ленивая загрузка базы цен."""
     global COSTS
     if COSTS is not None:
         return COSTS
@@ -30,7 +38,7 @@ def _load_costs() -> dict:
         try:
             with open(costs_db_path, "r", encoding="utf-8") as f:
                 COSTS = json.load(f)
-            logger.info(f"✅ База себестоимостей загружена: {costs_db_path}")
+            logger.info(f"✅ База цен загружена: {costs_db_path}")
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки costs_db.json: {e}")
             COSTS = _get_default_costs()
@@ -43,111 +51,127 @@ def _load_costs() -> dict:
 
 
 def _get_default_costs() -> dict:
-    """Встроенные значения по умолчанию (fallback)."""
+    """Встроенные значения по умолчанию (fallback) — ЦЕНЫ ДЛЯ КЛИЕНТА."""
     return {
         "education": {
             "documents": {
-                "certificate": {"cost": 150},
-                "diploma": {"cost": 200},
-                "certificate_worker": {"cost": 100},
-                "certificate_qualification": {"cost": 180},
+                "certificate": {"cost": 60},
+                "diploma": {"cost": 265},
+                "certificate_worker": {"cost": 80},
+                "certificate_qualification": {"cost": 130},
             },
             "materials": {
-                "paper_a4": {"cost": 2},
-                "ink_per_page": {"cost": 3},
-                "lamination": {"cost": 50},
+                "paper_a4": {"cost": 1.15},
+                "ink_per_page": {"cost": 2.5},
+                "lamination": {"cost": 10},
             },
             "labor": {
-                "methodist_hour": {"cost": 500},
-                "ro_hour": {"cost": 700},
-                "portal_access": {"cost": 500},
+                "methodist_hour": {"cost": 227},
+                "ro_hour": {"cost": 600},
+                "portal_access": {"cost": 57},
             },
             "delivery": {
-                "post_russia": {"cost": 350},
+                "post_russia": {"cost": 300},
             },
             "overhead": {
-                "base": {"cost": 2000},
+                "base": {"cost": 100},
+            },
+            "rates": {
+                "teacher_daily": {"cost": 8000, "unit": "день"},
+                "manikin_daily": {"cost": 15000, "unit": "день"},
+                "venue_daily": {"cost": 3000, "unit": "день"},
+                "transport_fixed": {
+                    "cost": 10000,
+                    "unit": "выезд",
+                    "range": [5000, 15000],
+                },
             },
             "forms": {
                 "full_time": {
-                    "fuel_cost_per_km": 55,
+                    "fuel_cost_per_km": 5,
                     "accommodation_per_night": 2500,
-                    "daily_allowance": 500,
+                    "daily_allowance": 1000,
                 }
             },
         },
         "sout": {
             "category_rates": {
-                "1": {
-                    "full_cost": 3500,  # Полная карта
-                    "analogy_cost": 700,  # Аналогия
-                    "card_cost": 500,  # Только карта
-                },
-                "2": {
-                    "full_cost": 4500,
-                    "analogy_cost": 900,
-                    "card_cost": 700,
-                },
+                "1": {"full_cost": 900, "card_cost": 1500, "analogy_cost": 100},
+                "2": {"full_cost": 1800, "card_cost": 2000, "analogy_cost": 100},
             },
-            "analogy_protocol_set": {"cost": 1500},
+            "analogy_protocol_set": {"cost": 1000},
             "materials": {
-                "paper_a4": {"cost": 2, "default_quantity": 100},
-                "ink_per_page": {"cost": 3, "default_quantity": 100},
-            },
-            "labor": {
-                "expert_fixed": {"cost": 3600},
-                "expert_per_rm": {"cost": 360},
-                "measurer_per_rm": {"cost": 200},
+                "paper_a4": {"cost": 1.15, "default_quantity": 20},
+                "ink_per_page": {"cost": 2.5, "default_quantity": 20},
             },
             "delivery": {
-                "post_russia": {"cost": 350},
+                "post_russia": {"cost": 500},
+                "post_russia_high": {"cost": 1000},
+            },
+            "iii_subcontractor": {
+                "ranges": [
+                    {"max_rm": 10, "cost": 5000},
+                    {"max_rm": 15, "cost": 6000},
+                    {"max_rm": 20, "cost": 7000},
+                ]
+            },
+            "travel": {
+                "fixed_trip_cost": 12000,
+                "trip_days_default": 3,
+                "daily_allowance": 500,
+                "accommodation_per_night": 2500,
+                "measurer_daily_rate": 5000,
+                "seasonal_multiplier": 2,
             },
         },
         "plk": {
             "base_cost_per_point": {"cost": 41.9},
             "labor": {
-                "measurer_per_point": {"cost": 150},
+                "measurer_per_point": {"cost": 20},
             },
             "materials": {
-                "paper_a4": {"cost": 2, "default_quantity": 50},
-                "ink_per_page": {"cost": 3, "default_quantity": 50},
+                "paper_a4": {"cost": 1.15, "default_quantity": 6},
+                "ink_per_page": {"cost": 2.5, "default_quantity": 6},
             },
             "delivery": {
-                "post_russia": {"cost": 350},
+                "post_russia": {"cost": 500},
             },
             "subcontractor": {
-                "default_cost": 5000,
+                "default_cost": 10000,
             },
             "travel": {
-                "transport_default": 5000,
-                "accommodation_default": 2500,
-                "daily_allowance": 500,
+                "transport_default": 40000,
+                "accommodation_default": 4000,
+                "daily_allowance": 4000,
             },
         },
         "opr": {
+            "rates": {
+                "per_position": {"cost": 500, "unit": "должность"},
+                "per_person": {"cost": 150, "unit": "человек"},
+            },
             "materials": {
-                "paper_a4": {"cost": 2, "default_quantity": 50},
-                "ink_per_page": {"cost": 3, "default_quantity": 50},
+                "paper_a4": {"cost": 1.15, "default_quantity": 16},
+                "ink_per_page": {"cost": 2.5, "default_quantity": 16},
             },
             "labor": {
                 "sot_per_rm": {"cost": 40},
-                "processing_per_rm": {"cost": 30},
-                "program_per_day": {"cost": 2000},
+                "processing_per_rm": {"cost": 10},
+                "program_per_day": {"cost": 10},
             },
             "delivery": {
-                "post_russia": {"cost": 350},
+                "post_russia": {"cost": 1000},
             },
         },
         "guarantees": {
             "application": {
                 "bank_guarantee_cost": {
                     "ranges": [
-                        {"max_contract": 100000, "real_cost": 1000},
+                        {"max_contract": 50000, "real_cost": 1000},
+                        {"max_contract": 100000, "real_cost": 1200},
                         {"max_contract": 500000, "real_cost": 2000},
-                        {"max_contract": 1000000, "real_cost": 3000},
-                        {"max_contract": 5000000, "real_cost": 5000},
-                        {"max_contract": 10000000, "real_cost": 7000},
-                        {"max_contract": 999999999999, "real_cost": 10000},
+                        {"max_contract": 1000000, "real_cost": 4000},
+                        {"max_contract": 5000000, "real_cost": 10000},
                     ]
                 }
             }
@@ -169,16 +193,14 @@ def _get_default_costs() -> dict:
 
 @dataclass
 class CalculationResult:
-    """Результат расчёта тендера."""
-
-    cost_price: float  # Себестоимость
-    recommended_price: float  # Рекомендуемая цена (с маржой)
-    margin_percent: float  # Маржа (%)
-    margin_rub: float  # Маржа (руб)
-    transport_cost: float  # Транспортные расходы
-    subcontractor_cost: float  # Субподряд
-    guarantee_cost: float  # Обеспечение (БГ)
-    details: dict  # Детализация
+    cost_price: float
+    recommended_price: float
+    margin_percent: float
+    margin_rub: float
+    transport_cost: float
+    subcontractor_cost: float
+    guarantee_cost: float = 0.0
+    details: dict = None
 
     def to_dict(self) -> dict:
         return {
@@ -195,13 +217,13 @@ class CalculationResult:
 
 class TenderCalculator:
     """
-    Калькулятор для всех типов тендеров.
-    Поддерживает: обучение, СОУТ, ПЛК, ОПР.
+    Калькулятор ЦЕНЫ ДЛЯ КЛИЕНТА для всех типов тендеров.
+    Поддерживает: обучение, СОУТ (3 варианта), ПЛК, ОПР, combined.
     """
 
     def __init__(self):
         self.costs = _load_costs()
-        logger.info("TenderCalculator инициализирован")
+        logger.info("TenderCalculator инициализирован (ЦЕНА ДЛЯ КЛИЕНТА)")
 
     # ==================== ОБУЧЕНИЕ ====================
 
@@ -214,41 +236,27 @@ class TenderCalculator:
         qual_certs: int = 0,
         protocols_count: int = 0,
         is_distance: bool = True,
-        days_full_time: int = 0,
+        teacher_days: int = 0,
+        teacher_rate: int = 8000,
         accommodation_nights: int = 0,
         transport_km: int = 0,
         venue_rent_days: int = 0,
-        teacher_days: int = 0,
-        teacher_rate: int = 4000,
         manikin_days: int = 0,
         delivery_count: int = 1,
         has_lamination: bool = False,
+        tender_text: str = "",
     ) -> CalculationResult:
         """
-        Расчёт тендера на обучение.
-
-        Args:
-            students_count: Общее количество слушателей
-            certificates: Количество удостоверений (если 0 — берётся students_count)
-            diplomas: Количество дипломов специалистов
-            worker_certs: Свидетельства рабочим
-            qual_certs: Свидетельства повышения квалификации
-            protocols_count: Протоколы по охране труда
-            is_distance: Дистанционная форма (True) или очная (False)
-            days_full_time: Дней очного обучения
-            accommodation_nights: Ночей проживания
-            transport_km: Километраж (для расчёта бензина)
-            venue_rent_days: Дней аренды помещения
-            teacher_days: Дней работы преподавателя
-            teacher_rate: Ставка преподавателя за день
-            manikin_days: Дней аренды манекена
-            delivery_count: Количество отправок почтой
-            has_lamination: Нужна ламинация удостоверений
+        Расчёт цены для клиента на обучение.
+        ИСПРАВЛЕНО v5.5:
+        - teacher_days из ТЗ (не авто-расчёт ceil/25)
+        - Минимум 10000₽ и для очного обучения
         """
         edu = self.costs["education"]
+        rates = edu.get("rates", {})
+        text_lower = tender_text.lower()
 
         # === Документы ===
-        # Если certificates не указаны — считаем по students_count
         actual_certificates = certificates if certificates > 0 else students_count
 
         docs_cost = (
@@ -257,9 +265,6 @@ class TenderCalculator:
             + worker_certs * edu["documents"]["certificate_worker"]["cost"]
             + qual_certs * edu["documents"]["certificate_qualification"]["cost"]
         )
-
-        # Протоколы — бесплатно (входят в стоимость)
-        # Но если прописаны удостоверения к протоколам — уже учтены в certificates
 
         # === Материалы ===
         total_docs = (
@@ -274,9 +279,7 @@ class TenderCalculator:
         )
 
         # === Труд ===
-        # Методист: 3 часа на тендер
         methodist_cost = 3 * edu["labor"]["methodist_hour"]["cost"]
-        # РО: 3 часа на тендер
         ro_cost = 3 * edu["labor"]["ro_hour"]["cost"]
         portal_cost = edu["labor"]["portal_access"]["cost"]
 
@@ -286,48 +289,96 @@ class TenderCalculator:
         # === Накладные ===
         overhead_cost = edu["overhead"]["base"]["cost"]
 
-        # === Очная часть (если есть) ===
+        # === Очная часть ===
         full_time_cost = 0
         transport_cost = 0
+        teacher_cost = 0
+        accommodation_cost = 0
+        daily_allowance_cost = 0
+        venue_cost = 0
+        manikin_cost = 0
 
-        if not is_distance and days_full_time > 0:
-            # Транспорт: бензин
-            fuel_liters = (
-                (transport_km / 100)
-                * edu["forms"]["full_time"]["fuel_cost_per_km"]
-                * 100
-                / 55
-            )  # 11л/100км
-            # Или проще: (km / 100) * 11 * 55
-            fuel_liters = (transport_km / 100) * 11
-            transport_cost = fuel_liters * 55
+        if not is_distance:
+            # --- Преподаватель: из ТЗ, не авто ---
+            if teacher_days > 0:
+                teacher_cost = teacher_days * teacher_rate
+            else:
+                # ← v6.2: Улучшенный fallback: оценка по слушателям и городам
+                if students_count > 0:
+                    # ~25 слушателей в день, минимум 1 день
+                    estimated_days = max(1, math.ceil(students_count / 25))
+                    teacher_days = estimated_days
+                    logger.info(
+                        f"[v6.2] Авто-оценка teacher_days={teacher_days} "
+                        f"({students_count} слуш., ~25/день)"
+                    )
+                else:
+                    teacher_days = 1
+                    logger.info(
+                        f"[v5.5] teacher_days не указан → fallback 1 день × {teacher_rate}"
+                    )
+                teacher_cost = teacher_days * teacher_rate
 
-            # Преподаватель
-            teacher_cost = teacher_days * teacher_rate
+            # --- Проезд: если transport_km=0 — fallback фиксированный ---
+            if transport_km > 0:
+                fuel_liters = (transport_km / 100) * 11
+                transport_cost = fuel_liters * 55
+            else:
+                transport_fixed = rates.get("transport_fixed", {}).get("cost", 10000)
+                transport_cost = transport_fixed
+                logger.info(f"[v5.5] Fallback transport_cost={transport_cost} (km=0)")
 
-            # Проживание
-            accommodation_cost = (
-                accommodation_nights
-                * edu["forms"]["full_time"]["accommodation_per_night"]
-            )
+            # --- Проживание: из ТЗ, не авто ---
+            if accommodation_nights > 0:
+                accommodation_cost = (
+                    accommodation_nights
+                    * edu["forms"]["full_time"]["accommodation_per_night"]
+                )
+            else:
+                # Fallback: если не указано — teacher_days ночей
+                accommodation_nights = teacher_days
+                accommodation_cost = (
+                    accommodation_nights
+                    * edu["forms"]["full_time"]["accommodation_per_night"]
+                )
 
-            # Суточные
-            daily_allowance = (teacher_days + 2) * edu["forms"]["full_time"][
+            # --- Суточные ---
+            daily_allowance_cost = (teacher_days + 2) * edu["forms"]["full_time"][
                 "daily_allowance"
-            ]  # +2 дня дороги
+            ]
 
-            # Аренда помещения
-            venue_cost = venue_rent_days * 5000  # минимум из диапазона
+            # --- Аренда: из ТЗ, не авто ---
+            if venue_rent_days > 0:
+                venue_daily = rates.get("venue_daily", {}).get("cost", 3000)
+                venue_cost = venue_rent_days * venue_daily
+            else:
+                # Fallback: если не указана — teacher_days дней
+                venue_rent_days = teacher_days
+                venue_daily = rates.get("venue_daily", {}).get("cost", 3000)
+                venue_cost = venue_rent_days * venue_daily
 
-            # Манекен
-            manikin_cost = manikin_days * 2000  # минимум из диапазона
+            # --- Манекен: авто-определение по тексту ТЗ ---
+            if manikin_days == 0 and (
+                "первая помощь" in text_lower or "манекен" in text_lower
+            ):
+                manikin_days = 1
+                logger.info(
+                    f"[v5.5] Авто-определение manikin_days=1 (первая помощь/манекен в ТЗ)"
+                )
+            manikin_daily = rates.get("manikin_daily", {}).get("cost", 15000)
+            manikin_cost = manikin_days * manikin_daily
 
             full_time_cost = (
                 teacher_cost
                 + accommodation_cost
-                + daily_allowance
+                + daily_allowance_cost
                 + venue_cost
                 + manikin_cost
+            )
+            logger.info(
+                f"[v5.5] Очные затраты: препод={teacher_cost}, проезд={transport_cost}, "
+                f"прожив={accommodation_cost}, суточные={daily_allowance_cost}, "
+                f"аренда={venue_cost}, манекен={manikin_cost}"
             )
 
         # === Итого себестоимость ===
@@ -345,12 +396,12 @@ class TenderCalculator:
             + transport_cost
         )
 
-        # === Маржа 10% ===
+        # === Цена для клиента = себестоимость + маржа 10% ===
         margin_percent = 10.0
         margin_rub = cost_price * (margin_percent / 100)
         recommended_price = cost_price + margin_rub
 
-        # Минимум 10 000₽
+        # === v5.5: Минимум 10 000₽ для ВСЕХ типов обучения ===
         if recommended_price < 10000:
             recommended_price = 10000
             margin_rub = recommended_price - cost_price
@@ -375,7 +426,17 @@ class TenderCalculator:
                 "overhead_cost": overhead_cost,
                 "full_time_cost": full_time_cost,
                 "is_distance": is_distance,
-                "days_full_time": days_full_time,
+                "teacher_days": teacher_days,
+                "teacher_cost": teacher_cost,
+                "accommodation_nights": accommodation_nights,
+                "accommodation_cost": accommodation_cost,
+                "daily_allowance_cost": daily_allowance_cost,
+                "transport_km": transport_km,
+                "transport_cost": transport_cost,
+                "venue_rent_days": venue_rent_days,
+                "venue_cost": venue_cost,
+                "manikin_days": manikin_days,
+                "manikin_cost": manikin_cost,
             },
         )
 
@@ -390,72 +451,73 @@ class TenderCalculator:
         variant: Literal[1, 2, 3] = 1,
         delivery_count: int = 1,
         is_annual: bool = False,
+        # v5.5: addresses_count → cities_count (уникальные города)
+        cities_count: int = 1,
+        addresses_count: int = 1,  # для обратной совместимости
+        trip_days: int = 3,
         transport_cost: float = 0,
         accommodation_nights: int = 0,
         expert_days: int = 1,
+        is_seasonal: bool = False,
     ) -> CalculationResult:
         """
-        Расчёт тендера СОУТ. 3 варианта расчёта.
+        Расчёт ЦЕНЫ ДЛЯ КЛИЕНТА на СОУТ. 3 варианта расчёта.
 
-        Args:
-            rm_total: Общее количество рабочих мест
-            rm_category_1: РМ 1 категории
-            rm_category_2: РМ 2 категории
-            rm_with_iii: РМ с ионизирующими излучениями
-            variant: Вариант расчёта (1, 2, 3)
-            delivery_count: Количество отправок документов
-            is_annual: Годовой тендер (12 отправок)
-            transport_cost: Транспортные расходы (ручной ввод)
-            accommodation_nights: Ночей проживания
-            expert_days: Дней работы эксперта
+        ИСПРАВЛЕНО v5.5:
+        - cities_count (уникальные города) для выездов, не addresses_count (БАГ 4.1)
+        - Замерщик = trip_days × 5000, не × trips (БАГ 4.2)
+        - Для 1 адреса: авто-расчёт выезда 12000 + trip_days×500 + (trip_days-1)×2500 + trip_days×5000 (БАГ 4.3)
         """
         sout = self.costs["sout"]
         cat = sout["category_rates"]
+        sout_travel = sout.get("travel", {})
 
         # === Субподряд ИИИ ===
         subcontractor_cost = 0
         if rm_with_iii > 0:
-            if rm_with_iii <= 10:
-                subcontractor_cost = 5000
-            elif rm_with_iii <= 15:
-                subcontractor_cost = 6000
-            elif rm_with_iii <= 20:
-                subcontractor_cost = 7000
+            for range_info in sout["iii_subcontractor"]["ranges"]:
+                if rm_with_iii <= range_info["max_rm"]:
+                    subcontractor_cost = range_info["cost"]
+                    break
             else:
-                subcontractor_cost = 7000 + (rm_with_iii - 20) * 350  # Экстраполяция
+                subcontractor_cost = 7000 + (rm_with_iii - 20) * 350
 
-        # === Расчёт по вариантам ===
+        # === Расчёт по вариантам (ЦЕНА ДЛЯ КЛИЕНТА) ===
         if variant == 1:
-            # 20% основных РМ + аналогия полностью
-            main_rm = max(2, int(rm_total * 0.2))  # 20%, но не менее 2
-            analogy_rm = rm_total - main_rm
+            main_rm = max(2, int(rm_total * 0.2))
+            if rm_category_1 + rm_category_2 > 0:
+                ratio_c1 = rm_category_1 / (rm_category_1 + rm_category_2)
+                main_c1 = int(main_rm * ratio_c1)
+                main_c2 = main_rm - main_c1
+            else:
+                main_c1 = main_rm
+                main_c2 = 0
 
-            cost = (
-                main_rm * cat["1"]["full_cost"]  # Предполагаем 1 категорию для основных
+            analogy_rm = rm_total - main_rm
+            price = (
+                main_c1 * cat["1"]["full_cost"]
+                + main_c2 * cat["2"]["full_cost"]
                 + analogy_rm * cat["1"]["analogy_cost"]
             )
 
         elif variant == 2:
-            # 1 карта + остаток из аналогии
             cards_cost = (
-                rm_category_1 * cat["1"]["card_cost"]
-                + rm_category_2 * cat["2"]["card_cost"]
+                rm_category_1 * cat["1"]["full_cost"]
+                + rm_category_2 * cat["2"]["full_cost"]
             )
             analogy_rm = rm_total - (rm_category_1 + rm_category_2)
-            analogy_cost = analogy_rm * cat["1"]["analogy_cost"]
-            cost = cards_cost + analogy_cost
+            analogy_cost = analogy_rm * 200
+            price = cards_cost + analogy_cost
 
         else:  # variant == 3
-            # Кол-во карт + комплекты протоколов (20%, минимум 2)
             cards_cost = (
                 rm_category_1 * cat["1"]["card_cost"]
                 + rm_category_2 * cat["2"]["card_cost"]
             )
-            # ИСПРАВЛЕНО: защита от отрицательного значения
             remaining_rm = max(0, rm_total - rm_category_1 - rm_category_2)
             protocol_sets = max(2, int(remaining_rm * 0.2))
             protocol_cost = protocol_sets * sout["analogy_protocol_set"]["cost"]
-            cost = cards_cost + protocol_cost
+            price = cards_cost + protocol_cost
 
         # === Материалы ===
         materials_cost = (
@@ -465,36 +527,53 @@ class TenderCalculator:
             * sout["materials"]["ink_per_page"]["default_quantity"]
         )
 
-        # === Труд ===
-        # Эксперт: фиксированно 3600 или по РМ
-        if rm_total <= 10:
-            expert_cost = sout["labor"]["expert_fixed"]["cost"]
-        else:
-            expert_cost = rm_total * sout["labor"]["expert_per_rm"]["cost"]
-
-        # Замерщик
-        measurer_cost = rm_total * sout["labor"]["measurer_per_rm"]["cost"]
-
         # === Доставка ===
         actual_delivery = 12 if is_annual else delivery_count
         delivery_cost = actual_delivery * sout["delivery"]["post_russia"]["cost"]
 
-        # === Проживание ===
-        accommodation_cost = accommodation_nights * 2500
+        # === v5.5: Командировочные расходы ===
+        seasonal_mult = sout_travel.get("seasonal_multiplier", 2) if is_seasonal else 1
+        fixed_trip = sout_travel.get("fixed_trip_cost", 12000)
+        daily_allowance_rate = sout_travel.get("daily_allowance", 500)
+        accommodation_rate = sout_travel.get("accommodation_per_night", 2500)
+        measurer_rate = sout_travel.get("measurer_daily_rate", 5000)
 
-        # === Суточные эксперта ===
-        daily_allowance = expert_days * 5000
+        # v5.5: Используем cities_count (уникальные города), не addresses_count
+        if cities_count > 1 or is_seasonal:
+            # Многогородний или сезонный СОУТ
+            trips = cities_count * seasonal_mult
+            travel_cost_auto = trips * fixed_trip
+            daily_allowance_auto = trip_days * trips * daily_allowance_rate
+            accommodation_cost_auto = (trip_days - 1) * trips * accommodation_rate
+            # v5.5: Замерщик = trip_days × measurer_rate (убран trips)
+            measurer_cost_auto = trip_days * measurer_rate
+            logger.info(
+                f"[v5.5] СОУТ командировочные: городов={cities_count}, сезон={is_seasonal}, "
+                f"дней={trip_days}, выезды={travel_cost_auto}, суточные={daily_allowance_auto}, "
+                f"прожив={accommodation_cost_auto}, замерщик={measurer_cost_auto}"
+            )
+        else:
+            # v5.5: Для 1 города — авто-расчёт (БАГ 4.3)
+            # Раньше: travel_cost_auto = transport_cost (часто 0), daily_allowance=0
+            # Сейчас: минимальный выезд
+            travel_cost_auto = fixed_trip  # 12000 — минимальный выезд
+            daily_allowance_auto = trip_days * daily_allowance_rate
+            accommodation_cost_auto = (trip_days - 1) * accommodation_rate
+            measurer_cost_auto = trip_days * measurer_rate
+            logger.info(
+                f"[v5.5] СОУТ 1 город: выезд={travel_cost_auto}, суточные={daily_allowance_auto}, "
+                f"прожив={accommodation_cost_auto}, замерщик={measurer_cost_auto}"
+            )
 
-        # === Итого ===
+        # === ИТОГО: цена для клиента ===
         cost_price = (
-            cost
+            price
             + materials_cost
-            + expert_cost
-            + measurer_cost
             + delivery_cost
-            + transport_cost
-            + accommodation_cost
-            + daily_allowance
+            + travel_cost_auto
+            + daily_allowance_auto
+            + accommodation_cost_auto
+            + measurer_cost_auto
             + subcontractor_cost
         )
 
@@ -506,13 +585,15 @@ class TenderCalculator:
         # Минимум 20 000₽ для СОУТ
         if recommended_price < 20000:
             recommended_price = 20000
+            margin_rub = recommended_price - cost_price
+            margin_percent = (margin_rub / cost_price) * 100 if cost_price > 0 else 0
 
         return CalculationResult(
             cost_price=cost_price,
             recommended_price=recommended_price,
             margin_percent=margin_percent,
             margin_rub=margin_rub,
-            transport_cost=transport_cost,
+            transport_cost=travel_cost_auto,
             subcontractor_cost=subcontractor_cost,
             guarantee_cost=0,
             details={
@@ -522,14 +603,92 @@ class TenderCalculator:
                 "rm_category_1": rm_category_1,
                 "rm_category_2": rm_category_2,
                 "rm_with_iii": rm_with_iii,
-                "main_calculation": cost,
+                "main_calculation": price,
                 "materials_cost": materials_cost,
-                "expert_cost": expert_cost,
-                "measurer_cost": measurer_cost,
                 "delivery_cost": delivery_cost,
-                "accommodation_cost": accommodation_cost,
-                "daily_allowance": daily_allowance,
+                "travel_cost": travel_cost_auto,
+                "daily_allowance": daily_allowance_auto,
+                "accommodation_cost": accommodation_cost_auto,
+                "measurer_cost": measurer_cost_auto,
+                "cities_count": cities_count,  # v5.5
+                "addresses_count": addresses_count,
+                "trip_days": trip_days,
                 "is_annual": is_annual,
+                "is_seasonal": is_seasonal,
+            },
+        )
+
+    # ==================== COMBINED (СОУТ + ОПР) ====================
+
+    def calculate_combined(
+        self,
+        rm_total: int,
+        rm_category_1: int = 0,
+        rm_category_2: int = 0,
+        rm_with_iii: int = 0,
+        opr_positions: int = 0,
+        opr_persons: int = 0,
+        variant: Literal[1, 2, 3] = 1,
+        delivery_count: int = 1,
+        is_annual: bool = False,
+        cities_count: int = 1,  # v5.5
+        addresses_count: int = 1,
+        trip_days: int = 3,
+        transport_cost: float = 0,
+        accommodation_nights: int = 0,
+        expert_days: int = 1,
+        is_seasonal: bool = False,
+    ) -> CalculationResult:
+        """
+        Расчёт ЦЕНЫ ДЛЯ КЛИЕНТА на combined (СОУТ + ОПР).
+        Считаем СОУТ и ОПР отдельно, суммируем.
+        """
+        # Считаем СОУТ
+        sout_result = self.calculate_sout(
+            rm_total=rm_total,
+            rm_category_1=rm_category_1,
+            rm_category_2=rm_category_2,
+            rm_with_iii=rm_with_iii,
+            variant=variant,
+            delivery_count=delivery_count,
+            is_annual=is_annual,
+            cities_count=cities_count,  # v5.5
+            addresses_count=addresses_count,
+            trip_days=trip_days,
+            transport_cost=transport_cost,
+            accommodation_nights=accommodation_nights,
+            expert_days=expert_days,
+            is_seasonal=is_seasonal,
+        )
+
+        # v5.5: ОПР считаем через calculate_opr (с rm_count)
+        opr_result = self.calculate_opr(
+            rm_count=rm_total,
+            delivery_count=delivery_count,
+            transport_cost=transport_cost,
+        )
+
+        # Итого
+        combined_cost_price = sout_result.cost_price + opr_result.cost_price
+        margin_percent = 10.0
+        margin_rub = combined_cost_price * 0.1
+        recommended_price = combined_cost_price + margin_rub
+
+        return CalculationResult(
+            cost_price=combined_cost_price,
+            recommended_price=recommended_price,
+            margin_percent=margin_percent,
+            margin_rub=margin_rub,
+            transport_cost=sout_result.transport_cost,
+            subcontractor_cost=sout_result.subcontractor_cost,
+            guarantee_cost=0,
+            details={
+                **sout_result.details,
+                "type": "combined",
+                "opr_cost_price": opr_result.cost_price,
+                "opr_details": opr_result.details,
+                "sout_cost_price": sout_result.cost_price,
+                "combined_cost_price": combined_cost_price,
             },
         )
 
@@ -545,27 +704,12 @@ class TenderCalculator:
         transport_cost: float = 0,
         accommodation_cost: float = 0,
     ) -> CalculationResult:
-        """
-        Расчёт тендера ПЛК (производственный лабораторный контроль).
-
-        Args:
-            points_count: Количество точек замеров
-            factors_count: Количество наименований факторов
-            delivery_count: Количество отправок документов
-            is_annual: Годовой тендер (12 отправок)
-            needs_subcontractor: Нужен субподряд (факторы вне аккредитации)
-            transport_cost: Транспортные расходы
-            accommodation_cost: Проживание
-        """
+        """Расчёт цены для клиента на ПЛК."""
         plk = self.costs["plk"]
 
-        # === Себестоимость точек ===
         points_cost = points_count * plk["base_cost_per_point"]["cost"]
-
-        # === Труд замерщика ===
         measurer_cost = points_count * plk["labor"]["measurer_per_point"]["cost"]
 
-        # === Материалы ===
         materials_cost = (
             plk["materials"]["paper_a4"]["cost"]
             * plk["materials"]["paper_a4"]["default_quantity"]
@@ -573,24 +717,20 @@ class TenderCalculator:
             * plk["materials"]["ink_per_page"]["default_quantity"]
         )
 
-        # === Доставка ===
         actual_delivery = 12 if is_annual else delivery_count
         delivery_cost = actual_delivery * plk["delivery"]["post_russia"]["cost"]
 
-        # === Субподряд ===
         subcontractor_cost = (
             plk["subcontractor"]["default_cost"] if needs_subcontractor else 0
         )
 
-        # === Транспортные и проживание ===
         travel = plk["travel"]
         if transport_cost == 0 and points_count > 0:
-            transport_cost = travel["transport_default"]  # Базовая закладка
+            transport_cost = travel["transport_default"]
         if accommodation_cost == 0:
             accommodation_cost = travel["accommodation_default"]
         daily_allowance = travel["daily_allowance"]
 
-        # === Итого ===
         cost_price = (
             points_cost
             + measurer_cost
@@ -602,14 +742,14 @@ class TenderCalculator:
             + daily_allowance
         )
 
-        # Маржа 10%
         margin_percent = 10.0
         margin_rub = cost_price * 0.1
         recommended_price = cost_price + margin_rub
 
-        # Минимум 15 000₽ для ПЛК
         if recommended_price < 15000:
             recommended_price = 15000
+            margin_rub = recommended_price - cost_price
+            margin_percent = (margin_rub / cost_price) * 100 if cost_price > 0 else 0
 
         return CalculationResult(
             cost_price=cost_price,
@@ -643,20 +783,9 @@ class TenderCalculator:
         needs_iot_norms: bool = False,
         transport_cost: float = 0,
     ) -> CalculationResult:
-        """
-        Расчёт тендера ОПР (оценка профессиональных рисков).
-
-        Args:
-            rm_count: Количество рабочих мест
-            delivery_count: Количество отправок документов
-            needs_siz_norms: Нужны нормы СИЗ
-            needs_dsiz_norms: Нужны нормы ДСИЗ
-            needs_iot_norms: Нужны ИОТ
-            transport_cost: Транспортные расходы
-        """
+        """Расчёт цены для клиента на ОПР."""
         opr = self.costs["opr"]
 
-        # === Материалы ===
         materials_cost = (
             opr["materials"]["paper_a4"]["cost"]
             * opr["materials"]["paper_a4"]["default_quantity"]
@@ -664,12 +793,10 @@ class TenderCalculator:
             * opr["materials"]["ink_per_page"]["default_quantity"]
         )
 
-        # === Труд ===
         sot_cost = rm_count * opr["labor"]["sot_per_rm"]["cost"]
         processing_cost = rm_count * opr["labor"]["processing_per_rm"]["cost"]
-        program_cost = opr["labor"]["program_per_day"]["cost"]  # 1 день программы
+        program_cost = opr["labor"]["program_per_day"]["cost"]
 
-        # === Доп. документы ===
         additional_cost = 0
         if needs_siz_norms:
             additional_cost += rm_count * 200
@@ -678,10 +805,8 @@ class TenderCalculator:
         if needs_iot_norms:
             additional_cost += rm_count * 200
 
-        # === Доставка ===
-        delivery_cost = delivery_count * 1000  # Базовая стоимость
+        delivery_cost = delivery_count * opr["delivery"]["post_russia"]["cost"]
 
-        # === Итого ===
         cost_price = (
             materials_cost
             + sot_cost
@@ -692,14 +817,14 @@ class TenderCalculator:
             + transport_cost
         )
 
-        # Маржа 30% для ОПР
         margin_percent = 30.0
         margin_rub = cost_price * 0.3
         recommended_price = cost_price + margin_rub
 
-        # Минимум 15 000₽ для ОПР
         if recommended_price < 15000:
             recommended_price = 15000
+            margin_rub = recommended_price - cost_price
+            margin_percent = (margin_rub / cost_price) * 100 if cost_price > 0 else 0
 
         return CalculationResult(
             cost_price=cost_price,
@@ -730,9 +855,7 @@ class TenderCalculator:
         contract_sum: float,
         guarantee_type: Literal["application", "contract"] = "contract",
     ) -> float:
-        """
-        Расчёт стоимости банковской гарантии.
-        """
+        """Расчёт стоимости банковской гарантии."""
         guarantees = self.costs["guarantees"]
 
         if guarantee_type == "application":
@@ -740,12 +863,9 @@ class TenderCalculator:
         else:
             guarantee_sum = contract_sum * 0.10
 
-        # Находим диапазон по СУММЕ КОНТРАКТА (не по guarantee_sum!)
         bg_cost = 1000
         for range_info in guarantees["application"]["bank_guarantee_cost"]["ranges"]:
-            if (
-                contract_sum <= range_info["max_contract"]
-            ):  # ← Исправлено: contract_sum вместо guarantee_sum
+            if contract_sum <= range_info["max_contract"]:
                 bg_cost = range_info["real_cost"]
                 break
 
@@ -761,28 +881,18 @@ class TenderCalculator:
         needs_flight: bool = False,
         flight_cost: float = 0,
     ) -> dict:
-        """
-        Расчёт транспортных расходов.
-
-        Returns:
-            dict: {fuel_cost, accommodation_cost, daily_allowance, total}
-        """
+        """Расчёт транспортных расходов."""
         travel = self.costs["travel"]
 
-        # Бензин
         fuel_liters = (distance_km / 100) * travel["fuel"]["consumption_l_per_100km"]
         fuel_cost = fuel_liters * travel["fuel"]["price_per_liter"]
 
-        # Или авиабилеты
         if needs_flight and flight_cost > 0:
-            fuel_cost = flight_cost * 2  # Туда-обратно
+            fuel_cost = flight_cost * 2
 
-        # Проживание
         accommodation_cost = (
             accommodation_nights * travel["accommodation"]["standard_per_night"]
         )
-
-        # Суточные
         daily_allowance = expert_days * travel["daily_allowance"]["standard"]
 
         return {

@@ -1,7 +1,13 @@
 """
 core/risk_rules.py
-Анализ рисков тендера по правилам из knowledge/risk_rules.yaml.
-Проверяет запрещённые направления, красные флаги, принимает решение.
+Анализ рисков тендера.
+ИСПРАВЛЕНО (26.07.2026 v6.0):
+  - Флаг «НМЦК завышена» (nmck > cost_price × 4)
+  - Принудительный MEDIUM при needs_manual_review
+  - make_decision() учитывает already_submitted
+  - Тип-зависимый min_nmck (из YAML)
+  - Тип-зависимый min_margin_percent
+  - cities_count вместо addresses_count для сложной логистики
 """
 
 import re
@@ -13,7 +19,6 @@ from loguru import logger
 
 from config.settings import settings
 
-# === ЛЕНИВАЯ ЗАГРУЗКА ПРАВИЛ РИСКОВ ===
 RISK_RULES: Optional[dict] = None
 
 
@@ -44,64 +49,108 @@ def _load_risk_rules() -> dict:
 
 
 def _get_default_risk_rules() -> dict:
-    """Встроенные правила рисков по умолчанию (fallback)."""
+    """Встроенные правила рисков по умолчанию."""
     return {
         "thresholds": {
-            "min_margin_percent": 5.0,
-            "max_cost_to_nmck_ratio": 0.95,
-            "min_execution_days_large_volume": 14,
-            "min_nmck": 50000,
+            "min_margin_percent": 10.0,
+            "max_cost_to_nmck_ratio": 0.85,
+            "min_execution_days": 15,
+            "min_execution_days_large_volume": 30,
+            "min_nmck": 100000,
+            # ← v6.0: Тип-зависимые пороги
+            "min_nmck_by_type": {
+                "education": 10000,
+                "sout": 20000,
+                "plk": 15000,
+                "opr": 15000,
+                "combined": 20000,
+            },
+            "min_margin_by_type": {
+                "education": 10.0,
+                "sout": 10.0,
+                "plk": 10.0,
+                "opr": 30.0,
+                "combined": 10.0,
+            },
         },
         "forbidden_directions": [
             {
-                "pattern": r"лицензи[яи]\s*мчс",
+                "pattern": r"\bлицензи[яи]\s+МЧС\b",
                 "name": "Лицензия МЧС",
                 "reason": "Нет лицензии МЧС",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"экспертиза\s*промышленной\s*безопасности",
+                "pattern": r"экспертиз[аыуеой]?\s+промышленной\s+безопасности",
                 "name": "Экспертиза промбезопасности",
                 "reason": "Требуется лицензия Ростехнадзора",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"медицинские\s*работники",
+                "pattern": r"\bпромбезопасност[иь]\b",
+                "name": "Промбезопасность",
+                "reason": "Требуется лицензия Ростехнадзора",
+                "allow_if_types": [],
+            },
+            {
+                "pattern": r"\bмедицинские\s+работники\b",
                 "name": "Медицинские работники",
                 "reason": "Нет медицинской лицензии",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"информационная\s*безопасность",
+                "pattern": r"\bинформационная\s+безопасность\b",
                 "name": "Информационная безопасность",
                 "reason": "Не наш профиль",
+                "allow_if_types": ["sout", "opr", "соут", "опр"],
             },
             {
-                "pattern": r"водительские\s*права",
+                "pattern": r"\bводительские\s+права\b",
                 "name": "Водительские права",
                 "reason": "Не наш профиль",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"гражданская\s*оборона",
+                "pattern": r"\bгражданская\s+оборона\b",
                 "name": "Гражданская оборона",
                 "reason": "Не наш профиль",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"категорированные\s*организации",
+                "pattern": r"\bкатегорированные\s+организации\b",
                 "name": "Категорированные организации",
                 "reason": "Требуется лицензия ФСТЭК",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"охранники\s*с\s*оружием",
+                "pattern": r"\bохранники\s+с\s+оружием\b",
                 "name": "Охранники с оружием",
                 "reason": "Требуется лицензия ЧОП",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"лицензи[яи]\s*фсб",
+                "pattern": r"\bлицензи[яи]\s+ФСБ\b",
                 "name": "Лицензия ФСБ",
                 "reason": "Требуется лицензия ФСБ",
+                "allow_if_types": [],
             },
             {
-                "pattern": r"гостайна",
+                "pattern": r"\bгостайна\b",
                 "name": "Государственная тайна",
                 "reason": "Требуется допуск к гостайне",
+                "allow_if_types": [],
+            },
+            {
+                "pattern": r"\bтехническая\s+диагностика\b",
+                "name": "Техническая диагностика",
+                "reason": "Требуется лицензия Ростехнадзора",
+                "allow_if_types": [],
+            },
+            {
+                "pattern": r"исследован[ио]\s*вод[ыу]|питьевая\s+вода|смыв[ыы]|гельминт[ыы]|биологи[яю]|микробиологи[яю]",
+                "name": "Вода/смывы/биология",
+                "reason": "Нет аккредитации",
+                "allow_if_types": [],
             },
         ],
         "red_flags": [
@@ -137,7 +186,23 @@ def _get_default_risk_rules() -> dict:
             },
             {
                 "name": "Сложная логистика",
-                "condition": "addresses_count > 3",
+                "condition": "cities_count > 3",  # ← v6.0: cities_count, не addresses_count
+                "level": "medium",
+            },
+            # ← v6.0: Новые флаги
+            {
+                "name": "НМЦК сильно выше расчётной цены",
+                "condition": "nmck > cost_price * 4",
+                "level": "high",
+            },
+            {
+                "name": "Требуется ручная проверка",
+                "condition": "needs_manual_review",
+                "level": "medium",
+            },
+            {
+                "name": "Низкая уверенность ИИ",
+                "condition": "llm_confidence < 0.3",
                 "level": "medium",
             },
         ],
@@ -157,6 +222,10 @@ def _get_default_risk_rules() -> dict:
             {
                 "condition": "nmck < min_nmck",
                 "decision": "не участвуем",
+            },
+            {
+                "condition": "already_submitted",
+                "decision": "подано",
             },
         ],
     }
@@ -183,10 +252,7 @@ class RiskResult:
 
 
 class RiskAnalyzer:
-    """
-    Анализатор рисков тендера.
-    Проверяет запрещённые направления, оценивает риски, принимает решение.
-    """
+    """Анализатор рисков тендера."""
 
     def __init__(self):
         self.rules = _load_risk_rules()
@@ -199,32 +265,34 @@ class RiskAnalyzer:
     def check_forbidden(
         self, tender_text: str, tender_type: Optional[str] = None
     ) -> list[str]:
-        """
-        Проверяет тендер на запрещённые направления.
-
-        Args:
-            tender_text: Полный текст тендера (ТЗ, извещение)
-            tender_type: Определённый тип тендера (опционально)
-
-        Returns:
-            list: Список найденных запрещённых направлений (пусто = можно)
-        """
         found = []
         if not tender_text:
             return found
 
         text_lower = tender_text.lower()
+        tender_type_lower = (tender_type or "").lower()
 
         for rule in self.forbidden:
             pattern = rule["pattern"]
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                found.append(f"{rule['name']}: {rule['reason']}")
-                logger.warning(f"Найдено запрещённое направление: {rule['name']}")
+            try:
+                if re.search(pattern, text_lower, re.IGNORECASE):
+                    allowed_types = rule.get("allow_if_types", [])
+                    if allowed_types and tender_type_lower in allowed_types:
+                        name = rule["name"]
+                        logger.info(
+                            'Пропущено запрещённое направление "%s" (тип тендера: %s)',
+                            name,
+                            tender_type,
+                        )
+                        continue
 
-        # Проверка смешанных лотов
-        if tender_type and "смешанный" in tender_type.lower():
-            # Если есть запрещённое — отказываем целиком
-            pass  # Уже проверено выше
+                    name = rule["name"]
+                    reason = rule["reason"]
+                    found.append(name + ": " + reason)
+                    logger.warning("Найдено запрещённое направление: %s", name)
+            except re.error as e:
+                name = rule["name"]
+                logger.error("Ошибка regex в правиле %s: %s", name, e)
 
         return found
 
@@ -238,17 +306,24 @@ class RiskAnalyzer:
         region_distance: int = 0,
         venue_required: bool = False,
         addresses_count: int = 1,
+        cities_count: int = 1,  # ← v6.0
         customer_complaint_rate: float = 0.0,
+        needs_manual_review: bool = False,  # ← v6.0
+        llm_confidence: float = 1.0,  # ← v6.0
     ) -> list[dict]:
-        """
-        Проверяет красные флаги (риски, но не отказ).
-
-        Returns:
-            list: Список активированных флагов с уровнем риска
-        """
+        """Проверяет красные флаги (риски, но не отказ)."""
         flags = []
 
-        # Маржа ниже минимума
+        # ← v6.0: Флаг «НМЦК завышена»
+        if cost_price > 0 and nmck > cost_price * 4:
+            flags.append(
+                {
+                    "name": "НМЦК сильно выше расчётной цены",
+                    "level": "high",
+                    "message": f"НМЦК {nmck:,.0f}₽ в {nmck/cost_price:.1f} раз выше расчётной цены {cost_price:,.0f}₽",
+                }
+            )
+
         if margin_percent < self.thresholds["min_margin_percent"]:
             flags.append(
                 {
@@ -258,7 +333,6 @@ class RiskAnalyzer:
                 }
             )
 
-        # Себестоимость близка к НМЦК
         if nmck > 0 and cost_price / nmck > self.thresholds["max_cost_to_nmck_ratio"]:
             flags.append(
                 {
@@ -268,31 +342,35 @@ class RiskAnalyzer:
                 }
             )
 
-        # Сжатые сроки
-        if (
-            volume_large
-            and deadline_days < self.thresholds["min_execution_days_large_volume"]
-        ):
+        if deadline_days > 0:
+            if (
+                volume_large
+                and deadline_days < self.thresholds["min_execution_days_large_volume"]
+            ):
+                flags.append(
+                    {
+                        "name": "Сжатые сроки",
+                        "level": "medium",
+                        "message": f"Срок {deadline_days} дней при большом объёме",
+                    }
+                )
+            elif deadline_days < 5:
+                flags.append(
+                    {
+                        "name": "Сверхсжатые сроки",
+                        "level": "high",
+                        "message": f"Срок исполнения {deadline_days} дней — критический риск",
+                    }
+                )
+        else:
             flags.append(
                 {
-                    "name": "Сжатые сроки",
-                    "level": "medium",
-                    "message": f"Срок {deadline_days} дней при большом объёме",
-                }
-            )
-        elif deadline_days < 5:
-            flags.append(
-                {
-                    "name": "Сверхсжатые сроки",
-                    "level": "high",
-                    "message": f"Срок исполнения {deadline_days} дней — критический риск",
+                    "name": "Сроки исполнения не определены",
+                    "level": "low",
+                    "message": "Нет данных о сроках исполнения (требуется детальный парсинг ТЗ)",
                 }
             )
 
-        # НМЦК ниже рынка (если есть данные)
-        # TODO: Интеграция с историческими данными
-
-        # Отдалённый регион
         if region_distance > 3000:
             flags.append(
                 {
@@ -302,7 +380,6 @@ class RiskAnalyzer:
                 }
             )
 
-        # Аренда помещения
         if venue_required:
             flags.append(
                 {
@@ -312,17 +389,36 @@ class RiskAnalyzer:
                 }
             )
 
-        # Сложная логистика
-        if addresses_count > 3:
+        # ← v6.0: cities_count вместо addresses_count
+        if cities_count > 3:
             flags.append(
                 {
                     "name": "Сложная логистика",
                     "level": "medium",
-                    "message": f"{addresses_count} адресов в разных городах",
+                    "message": f"{cities_count} городов — сложная логистика",
                 }
             )
 
-        # История жалоб заказчика
+        # ← v6.0: Флаг «Требуется ручная проверка»
+        if needs_manual_review:
+            flags.append(
+                {
+                    "name": "Требуется ручная проверка",
+                    "level": "medium",
+                    "message": "Данные ненадёжны — требуется ручная проверка ТЗ",
+                }
+            )
+
+        # ← v6.0: Флаг «Низкая уверенность ИИ»
+        if llm_confidence < 0.3:
+            flags.append(
+                {
+                    "name": "Низкая уверенность ИИ",
+                    "level": "medium",
+                    "message": f"Уверенность ИИ {llm_confidence:.2f} — данные могут быть неточными",
+                }
+            )
+
         if customer_complaint_rate > 0.3:
             flags.append(
                 {
@@ -355,31 +451,41 @@ class RiskAnalyzer:
         risk_level: str,
         nmck: float,
         already_submitted: bool = False,
+        needs_manual_review: bool = False,  # ← v6.0
+        tender_type: Optional[str] = None,  # ← v6.0
     ) -> Literal["рекомендуется", "не участвуем", "подано"]:
-        """
-        Принимает финальное решение по участию.
-
-        Note: already_submitted пока не используется (нет интеграции с историей).
-        В будущем: проверять через Google Sheets или TenderCache.
-
-        Returns:
-            str: Решение
-        """
-        # ИСПРАВЛЕНО: already_submitted пока не используется — нужна интеграция с БД
-        # if already_submitted:
-        #     return "подано"
+        """Принимает финальное решение по участию."""
+        # ← v6.0: already_submitted
+        if already_submitted:
+            return "подано"
 
         if not is_allowed:
             return "не участвуем"
 
-        if margin_percent < self.thresholds["min_margin_percent"]:
+        # ← v6.0: Тип-зависимый min_margin_percent
+        min_margin = self.thresholds.get("min_margin_percent", 10.0)
+        if tender_type:
+            type_margins = self.thresholds.get("min_margin_by_type", {})
+            min_margin = type_margins.get(tender_type.lower(), min_margin)
+
+        if margin_percent < min_margin:
             return "не участвуем"
 
         if risk_level == "high":
             return "не участвуем"
 
-        if nmck < self.thresholds["min_nmck"]:
+        # ← v6.0: Тип-зависимый min_nmck
+        min_nmck = self.thresholds.get("min_nmck", 100000)
+        if tender_type:
+            type_nmcks = self.thresholds.get("min_nmck_by_type", {})
+            min_nmck = type_nmcks.get(tender_type.lower(), min_nmck)
+
+        if nmck < min_nmck:
             return "не участвуем"
+
+        # ← v6.0: При needs_manual_review — риск MEDIUM минимум
+        if needs_manual_review and risk_level == "low":
+            risk_level = "medium"
 
         return "рекомендуется"
 
@@ -394,21 +500,17 @@ class RiskAnalyzer:
         region_distance: int = 0,
         venue_required: bool = False,
         addresses_count: int = 1,
+        cities_count: int = 1,  # ← v6.0
         customer_complaint_rate: float = 0.0,
         already_submitted: bool = False,
         tender_type: Optional[str] = None,
+        needs_manual_review: bool = False,  # ← v6.0
+        llm_confidence: float = 1.0,  # ← v6.0
     ) -> RiskResult:
-        """
-        Полный анализ рисков тендера.
-
-        Returns:
-            RiskResult: Полный результат анализа
-        """
-        # 1. Проверка запрещённых направлений
+        """Полный анализ рисков тендера."""
         forbidden = self.check_forbidden(tender_text, tender_type)
         is_allowed = len(forbidden) == 0
 
-        # 2. Проверка красных флагов
         flags_data = self.check_red_flags(
             margin_percent=margin_percent,
             cost_price=cost_price,
@@ -418,24 +520,30 @@ class RiskAnalyzer:
             region_distance=region_distance,
             venue_required=venue_required,
             addresses_count=addresses_count,
+            cities_count=cities_count,  # ← v6.0
             customer_complaint_rate=customer_complaint_rate,
+            needs_manual_review=needs_manual_review,  # ← v6.0
+            llm_confidence=llm_confidence,  # ← v6.0
         )
 
-        # 3. Определение уровня риска
         risk_level = self.determine_risk_level(flags_data)
         if not is_allowed:
             risk_level = "high"
 
-        # 4. Принятие решения
+        # ← v6.0: При needs_manual_review — принудительно MEDIUM минимум
+        if needs_manual_review and risk_level == "low":
+            risk_level = "medium"
+
         decision = self.make_decision(
             is_allowed=is_allowed,
             margin_percent=margin_percent,
             risk_level=risk_level,
             nmck=nmck,
             already_submitted=already_submitted,
+            needs_manual_review=needs_manual_review,  # ← v6.0
+            tender_type=tender_type,  # ← v6.0
         )
 
-        # 5. Формирование сообщений
         red_flags = [f["message"] for f in flags_data]
 
         logger.info(

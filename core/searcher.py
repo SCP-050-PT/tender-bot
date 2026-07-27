@@ -1,7 +1,11 @@
 """
 core/searcher.py
 Поиск тендеров на zakupki.gov.ru (ЕИС).
-Адаптирован из парсера уклонений (ZakupkiParser v12.3).
+ИСПРАВЛЕНО (21.07.2026 v2):
+  - Добавлен 615-ФЗ (совместные закупки)
+  - Улучшена защита от ложных срабатываний "информационная безопасность"
+  - Добавлена проверка контекста для составных фраз
+  - Синхронизированы exclude_keywords с risk_rules.yaml
 """
 
 import sys
@@ -36,7 +40,6 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-# === РОТАЦИЯ USER-AGENT ===
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
@@ -60,13 +63,8 @@ def get_platform_from_ua(user_agent: str) -> str:
     return "Windows"
 
 
-# === ДАТАКЛАССЫ ===
-
-
 @dataclass
 class TenderSearchResult:
-    """Результат поиска тендера."""
-
     tender_id: str
     title: str
     url: str
@@ -75,12 +73,12 @@ class TenderSearchResult:
     publish_date: Optional[str] = None
     deadline_date: Optional[str] = None
     etp: str = "zakupki.gov.ru"
-    law: str = "44-FZ"  # 44-FZ, 223-FZ
+    law: str = "44-FZ"
     okpd2: List[str] = field(default_factory=list)
     customer: Optional[str] = None
     status: Optional[str] = None
-    notice_guid: Optional[str] = None  # Для 223-ФЗ
-    raw_html: Optional[str] = None  # Для отладки
+    notice_guid: Optional[str] = None
+    raw_html: Optional[str] = None
 
     def to_dict(self) -> Dict:
         return {
@@ -100,59 +98,42 @@ class TenderSearchResult:
         }
 
 
-# === ФИЛЬТРЫ ЗАКАЗЧИЦЫ ===
-
 SEARCH_CONFIG = {
-    # ОКПД2 — ID из справочника ЕИС
     "okpd2_ids": [
-        "8874806",  # 85.42 — Дополнительное профобразование
-        "8879198",  # 71.20.11 — Услуги по испытанию и анализу
-        "8879202",  # 71.20.19 — Услуги по техническому контролю (вкл. СОУТ)
+        "8874806",
+        "8879198",
+        "8879202",
     ],
-    # Текстовые коды для отображения
     "okpd2_codes": [
         "85.42",
         "71.20.11",
         "71.20.19",
     ],
-    # Ключевые слова для фильтрации релевантности (проверяем title)
     "relevance_keywords": [
-        # Существительные
         "охрана труда",
         "охране труда",
         "охраны труда",
-        # СОУТ
         "СОУТ",
-        # Специальная оценка
         "специальная оценка условий труда",
         "специальной оценки условий труда",
         "специальной оценке условий труда",
-        # Оценка проф. рисков
         "оценка профессиональных рисков",
         "оценке профессиональных рисков",
         "оценки профессиональных рисков",
-        # ПЛК
         "производственный лабораторный контроль",
         "производственного лабораторного контроля",
-        # Замеры
         "замеры вредных факторов",
         "замеров вредных факторов",
         "вредные производственные факторы",
         "вредных производственных факторов",
-        # Обучение
         "обучение охране труда",
         "обучению охране труда",
         "обучения охране труда",
-        # ОПР
-        "оценка профессиональных рисков",
         "оценка проф. рисков",
-        # Пожарка (если нужна)
         "пожарная безопасность",
         "пожарной безопасности",
-        # Промбезопасность
         "промышленная безопасность",
         "промышленной безопасности",
-        # Другое
         "обучение рабочих профессий",
         "технологические карты",
         "санитарно-защитная зона",
@@ -161,12 +142,11 @@ SEARCH_CONFIG = {
         "аттестация рабочих мест",
         "аттестации рабочих мест",
     ],
-    # Запрещённые слова (если найдены — пропускаем)
+    # === ИСПРАВЛЕНО: Запрещённые слова (синхронизировано с risk_rules.yaml) ===
     "exclude_keywords": [
+        # Точные фразы
         "лицензия МЧС",
-        "экспертиза промышленной безопасности",
         "медицинские работники",
-        "информационная безопасность",
         "водительские права",
         "гражданская оборона",
         "категорированные организации",
@@ -178,27 +158,58 @@ SEARCH_CONFIG = {
         "гельминты",
         "биология",
         "микробиолог",
+        # Экспертиза промбезопасности — ВСЕ склонения
+        "экспертиза промышленной безопасности",
+        "экспертизы промышленной безопасности",
+        "экспертизе промышленной безопасности",
+        "экспертизу промышленной безопасности",
+        "экспертизой промышленной безопасности",
+        "экспертиз промышленной безопасности",
+        # Дополнительные варианты
+        "экспертиза безопасности",
+        "экспертизы безопасности",
+        "техническая диагностика",
+        "промбезопасность",
+        "промбезопасности",
     ],
-    # Фильтры суммы — НМЦК фильтр ТОЛЬКО на стороне ЕИС (priceFromGeneral)
-    # Локальная проверка отключена — ЕИС фильтрует точнее
+    # === ИСПРАВЛЕНО: Контекстные исключения ===
+    # Если найдено одно из этих слов — НЕ отклонять (ложное срабатывание)
+    "exclude_context_exceptions": [
+        "СОУТ",
+        "сои",
+        "специальная оценка",
+        "оценка профессиональных рисков",
+        "ОПР",
+        "охрана труда",
+        "обучение охране труда",
+    ],
+    # === НОВОЕ: Составные запрещённые фразы с контекстной проверкой ===
+    "exclude_composite": [
+        {
+            "words": ["экспертиз", "безопасност"],
+            "max_distance": 5,
+            "check_context": True,
+        },
+        {
+            "words": ["диагностик", "оборудован"],
+            "max_distance": 5,
+            "check_context": True,
+        },
+        {
+            "words": ["техническ", "диагностик"],
+            "max_distance": 5,
+            "check_context": True,
+        },
+    ],
     "min_nmck": 100000,
     "max_nmck_siz": 300000,
-    # Законы
-    "laws": ["44-FZ", "223-FZ"],
-    # Период поиска (дней)
+    "laws": ["44-FZ", "223-FZ", "615-FZ"],
     "publish_date_days": 14,
 }
 
 
 class TenderSearcher:
-    """
-    Поисковик тендеров на zakupki.gov.ru.
-    Адаптирован из ZakupkiParser v12.3.
-    """
-
     BASE_SEARCH_URL = "https://zakupki.gov.ru/epz/order/extendedsearch/results.html"
-
-    # Настройки параллелизма
     MAX_SEARCH_WORKERS = 5
     BATCH_SIZE = 50
     REQUEST_DELAY = (0.5, 1.5)
@@ -227,25 +238,18 @@ class TenderSearcher:
             f"{len(self._sessions)} sessions)"
         )
 
-    # =================================================================
-    # === ПУЛ СЕССИЙ ===
-    # =================================================================
-
     def _init_session_pool(self, pool_size: int = 3):
-        """Создаёт пул сессий для параллельных запросов."""
         for i in range(pool_size):
             session = self._create_session()
             self._sessions.append(session)
         logger.info(f"🔌 Пул сессий: {pool_size} шт.")
 
     def _get_session(self, index: int = 0) -> Any:
-        """Берёт сессию из пула."""
         if not self._sessions:
             return self._create_session()
         return self._sessions[index % len(self._sessions)]
 
     def _create_session(self) -> Any:
-        """Создаёт новую сессию."""
         user_agent = get_random_user_agent()
         platform = get_platform_from_ua(user_agent)
 
@@ -267,7 +271,6 @@ class TenderSearcher:
         return session
 
     def _update_session_headers(self, session, user_agent: str, platform: str):
-        """Обновляет заголовки сессии."""
         sec_ch_ua = '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
 
         session.headers.update(
@@ -289,18 +292,12 @@ class TenderSearcher:
         )
 
     def _rotate_user_agent(self):
-        """Меняет User-Agent."""
         user_agent = get_random_user_agent()
         platform = get_platform_from_ua(user_agent)
         self._update_session_headers(self.session, user_agent, platform)
         logger.debug(f"🎭 User-Agent изменён")
 
-    # =================================================================
-    # === ЗАДЕРЖКИ И ОБРАБОТКА ОШИБОК ===
-    # =================================================================
-
     def _calculate_delay(self) -> float:
-        """Вычисляет задержку с учётом 429."""
         if self._consecutive_429 > 0:
             delay = self._base_delay * (2 ** (self._consecutive_429 - 1))
             delay = min(delay, 300)
@@ -309,7 +306,6 @@ class TenderSearcher:
         return random.uniform(*self.REQUEST_DELAY)
 
     def _handle_429(self):
-        """Обработка ошибки 429 (Too Many Requests)."""
         self._consecutive_429 += 1
         self._rotate_user_agent()
         delay = self._calculate_delay()
@@ -317,14 +313,9 @@ class TenderSearcher:
         time.sleep(delay)
 
     def _reset_429_counter(self):
-        """Сброс счётчика 429."""
         if self._consecutive_429 > 0:
             logger.info(f"✅ Сброс 429 (было: {self._consecutive_429})")
             self._consecutive_429 = 0
-
-    # =================================================================
-    # === URL BUILDER ===
-    # =================================================================
 
     def _build_search_url(
         self,
@@ -332,7 +323,6 @@ class TenderSearcher:
         date_from: Optional[datetime.date] = None,
         date_to: Optional[datetime.date] = None,
     ) -> str:
-        """Строит URL для поиска тендеров."""
         today = datetime.now().date()
 
         if date_from is None:
@@ -353,11 +343,11 @@ class TenderSearcher:
             "recordsPerPage": "_50",
             "fz44": "on",
             "fz223": "on",
-            # НМЦК фильтр — ТОЛЬКО на стороне ЕИС
+            # === НОВОЕ: 615-ФЗ ===
+            "fz615": "on",
             "priceFromGeneral": str(self.config.get("min_nmck", 100000)),
         }
 
-        # ОКПД2 по ID справочника ЕИС
         if self.config.get("okpd2_ids"):
             params["okpd2Ids"] = ",".join(self.config["okpd2_ids"])
             params["okpd2IdsWithNested"] = "on"
@@ -365,14 +355,7 @@ class TenderSearcher:
                 params["okpd2IdsCodes"] = ",".join(self.config["okpd2_codes"])
 
         url = f"{self.BASE_SEARCH_URL}?{urlencode(params, safe='{}')}"
-        logger.debug(
-            f"🔗 URL {date_from.strftime('%d.%m')}–{date_to.strftime('%d.%m')}, стр.{page}"
-        )
         return url
-
-    # =================================================================
-    # === ЗАПРОСЫ ===
-    # =================================================================
 
     def _make_request(
         self,
@@ -381,7 +364,6 @@ class TenderSearcher:
         timeout: int = 30,
         max_retries: int = 3,
     ) -> Optional[Any]:
-        """Делает HTTP-запрос с retry."""
         if session is None:
             session = self.session
 
@@ -410,21 +392,11 @@ class TenderSearcher:
 
         return None
 
-    # =================================================================
-    # === ПОИСК ТЕНДЕРОВ ===
-    # =================================================================
-
     def search(
         self,
         max_pages: Optional[int] = None,
         max_results: Optional[int] = None,
     ) -> Generator[TenderSearchResult, None, None]:
-        """
-        Поиск тендеров (единый URL для 44-FZ и 223-FZ).
-
-        Фильтр НМЦК применяется на стороне ЕИС через priceFromGeneral.
-        Локальная проверка НМЦК отключена — ЕИС фильтрует точнее.
-        """
         total_found = 0
         seen_ids = set()
 
@@ -434,38 +406,28 @@ class TenderSearcher:
             f"📋 Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽ (на стороне ЕИС)"
         )
         logger.info(f"📋 Период: {self.config.get('publish_date_days', 14)} дней")
+        logger.info(f"📋 Законы: {self.config.get('laws', [])}")
         logger.info(f"📋 ОКПД2: {self.config.get('okpd2_codes', [])}")
         logger.info(f"{'='*60}")
 
         for result in self._search_single(max_pages):
-            # Проверка на дубликат
             if result.tender_id in seen_ids:
                 continue
             seen_ids.add(result.tender_id)
 
-            # Фильтр по релевантности (ключевые слова в title)
             if not self._is_relevant(result.title):
                 logger.debug(
                     f"  ⏭ {result.tender_id}: не релевантно — '{result.title[:60]}...'"
                 )
                 continue
 
-            # Фильтр по запрещённым словам
             if self._has_excluded_keywords(result.title):
                 logger.info(f"  🚫 {result.tender_id}: запрещённые слова в названии")
                 continue
 
-            # ❌ ЛОКАЛЬНЫЙ ФИЛЬТР НМЦК УБРАН — фильтр работает на стороне ЕИС
-            # if result.nmck and result.nmck < self.config["min_nmck"]:
-            #     logger.debug(
-            #         f"  ⏭ {result.tender_id}: НМЦК {result.nmck:,.0f} < {self.config['min_nmck']}"
-            #     )
-            #     continue
-
             total_found += 1
             yield result
 
-            # Лимит результатов
             if max_results and total_found >= max_results:
                 logger.info(f"✅ Достигнут лимит: {max_results} тендеров")
                 return
@@ -476,7 +438,6 @@ class TenderSearcher:
         self,
         max_pages: Optional[int] = None,
     ) -> Generator[TenderSearchResult, None, None]:
-        """Поиск тендеров (единый URL)."""
         url = self._build_search_url(page=1)
         response = self._make_request(url)
 
@@ -493,18 +454,15 @@ class TenderSearcher:
             logger.info("  ⏭ Нет результатов")
             return
 
-        # ИСПРАВЛЕНО: recordsPerPage = "_50", значит делим на 50 (не на 10!)
         total_pages = min((total_count // 50) + 1, max_pages or 100)
         logger.info(f"📊 ~{total_count} записей, страниц: {total_pages}")
 
-        # Парсим первую страницу
         for result in self._parse_search_results(response.text):
             yield result
 
         if total_pages <= 1:
             return
 
-        # Параллельная загрузка остальных страниц
         remaining_pages = list(range(2, total_pages + 1))
 
         with ThreadPoolExecutor(max_workers=self.MAX_SEARCH_WORKERS) as executor:
@@ -535,7 +493,6 @@ class TenderSearcher:
                     logger.error(f"  ❌ Ошибка страницы {page}: {e}")
 
     def _fetch_page(self, page: int) -> Optional[List[TenderSearchResult]]:
-        """Загружает одну страницу поиска."""
         session = self._get_session(page)
         url = self._build_search_url(page=page)
 
@@ -560,14 +517,8 @@ class TenderSearcher:
             logger.error(f"  ❌ Страница {page}: {e}")
             return None
 
-    # =================================================================
-    # === ПАРСИНГ ===
-    # =================================================================
-
     def _extract_total_count(self, html: str) -> int:
-        """Извлекает общее количество результатов."""
         soup = BeautifulSoup(html, "html.parser")
-        # ИСПРАВЛЕНО: добавлены паттерны для разных вариантов отображения ЕИС
         patterns = [
             r"более\s*([\d\s]+)\s*записей",
             r"([\d\s]+)\s*записей",
@@ -596,10 +547,7 @@ class TenderSearcher:
         self,
         html: str,
     ) -> Generator[TenderSearchResult, None, None]:
-        """Парсит карточки тендеров из HTML."""
         soup = BeautifulSoup(html, "html.parser")
-
-        # Находим карточки тендеров
         cards = soup.find_all("div", class_="registry-entry__form")
 
         logger.info(f"   📄 Найдено карточек: {len(cards)}")
@@ -614,20 +562,18 @@ class TenderSearcher:
                 continue
 
     def _parse_card(self, card: Any) -> Optional[TenderSearchResult]:
-        """Парсит одну карточку тендера из результатов поиска."""
-        # --- ЗАКОН ---
         law_elem = card.find("div", class_="registry-entry__header-top__title")
         law_text = law_elem.get_text(strip=True) if law_elem else ""
 
-        # Определяем закон
         if "223" in law_text:
             law = "223-FZ"
+        elif "615" in law_text:
+            law = "615-FZ"
         elif "44" in law_text:
             law = "44-FZ"
         else:
-            law = "44/223"
+            law = "44/223/615"
 
-        # --- РЕЕСТРОВЫЙ НОМЕР ---
         number_elem = card.find("div", class_="registry-entry__header-mid__number")
         if not number_elem:
             return None
@@ -642,14 +588,11 @@ class TenderSearcher:
         if not tender_id:
             return None
 
-        # --- URL ---
         purchase_url = self._normalize_purchase_url(href, law, tender_id)
 
-        # --- СТАТУС ---
         status_elem = card.find("div", class_="registry-entry__header-mid__title")
         status = status_elem.get_text(strip=True) if status_elem else None
 
-        # --- ОБЪЕКТ ЗАКУПКИ (title) ---
         title = ""
         obj_block = card.find("div", class_="registry-entry__body-block")
         if obj_block:
@@ -657,7 +600,6 @@ class TenderSearcher:
             if title_elem:
                 title = title_elem.get_text(strip=True)
 
-        # --- ЗАКАЗЧИК ---
         customer = None
         customer_elem = card.find("div", class_="registry-entry__body-href")
         if customer_elem:
@@ -665,14 +607,12 @@ class TenderSearcher:
             if customer_link:
                 customer = customer_link.get_text(strip=True)
 
-        # --- НМЦК ---
         nmck = None
         price_elem = card.find("div", class_="price-block__value")
         if price_elem:
             price_text = price_elem.get_text(strip=True)
             nmck = self._parse_price(price_text)
 
-        # --- ДАТЫ ---
         publish_date = None
         deadline_date = None
 
@@ -688,10 +628,8 @@ class TenderSearcher:
             elif "Окончание подачи заявок" in title_text:
                 deadline_date = value_text
 
-        # --- NOTICE GUID (для 223-ФЗ) ---
         notice_guid = None
-        if law == "223-FZ":
-            # Ищем в href на документы
+        if law in ["223-FZ", "615-FZ"]:
             docs_href = card.find("a", href=re.compile(r"noticeGuid="))
             if docs_href:
                 href_docs = docs_href.get("href", "")
@@ -704,7 +642,7 @@ class TenderSearcher:
             title=title,
             url=purchase_url,
             nmck=nmck,
-            region=None,  # Регион парсится только в detailed_parser
+            region=None,
             publish_date=publish_date,
             deadline_date=deadline_date,
             etp="zakupki.gov.ru",
@@ -716,25 +654,18 @@ class TenderSearcher:
         )
 
     def _normalize_purchase_url(self, href: str, law: str, tender_id: str) -> str:
-        """Нормализует URL тендера."""
-        # Если href уже полный URL
         if href.startswith("http"):
             return href
 
-        # Для 223-ФЗ
-        if law == "223-FZ":
+        if law in ["223-FZ", "615-FZ"]:
             return f"https://zakupki.gov.ru/223/purchase/public/purchase/info/common-info.html?regNumber={tender_id}"
 
-        # Для 44-ФЗ
         return f"https://zakupki.gov.ru/epz/order/notice/ea20/view/common-info.html?regNumber={tender_id}"
 
     def _parse_price(self, price_text: str) -> Optional[float]:
-        """Парсит цену из текста."""
-        # Убираем пробелы, &nbsp;, заменяем запятую на точку
         cleaned = price_text.replace("\xa0", "").replace(" ", "").replace("\u202f", "")
         cleaned = cleaned.replace("₽", "").replace("руб.", "").replace("руб", "")
 
-        # Ищем число с запятой или точкой
         match = re.search(r"([\d\s]+(?:[,.]\d{2})?)", cleaned)
         if match:
             price_str = match.group(1).replace(" ", "").replace(",", ".")
@@ -745,7 +676,7 @@ class TenderSearcher:
         return None
 
     # =================================================================
-    # === ФИЛЬТРЫ ===
+    # === ИСПРАВЛЕННЫЕ ФИЛЬТРЫ ===
     # =================================================================
 
     def _is_relevant(self, text: str) -> bool:
@@ -760,19 +691,69 @@ class TenderSearcher:
         return False
 
     def _has_excluded_keywords(self, text: str) -> bool:
-        """Проверяет наличие запрещённых слов."""
+        """
+        Проверяет наличие запрещённых слов.
+        ИСПРАВЛЕНО: контекстная проверка + исключения для СОУТ/ОПР.
+        """
         if not text:
             return False
 
         text_lower = text.lower()
+
+        # Проверка 1: Контекстные исключения
+        # Если в тексте есть слова СОУТ/ОПР/охрана труда — проверяем "информационная безопасность" отдельно
+        has_sout_context = any(
+            exc.lower() in text_lower
+            for exc in self.config.get("exclude_context_exceptions", [])
+        )
+
+        # Проверка 2: Точные подстроки
         for keyword in self.config.get("exclude_keywords", []):
-            if keyword.lower() in text_lower:
+            keyword_lower = keyword.lower()
+            if keyword_lower in text_lower:
+                # ИСПРАВЛЕНО: если контекст СОУТ/ОПР и найдено "информационная безопасность" — пропускаем
+                if has_sout_context and "информационная безопасность" in keyword_lower:
+                    logger.info(f"  ✅ Пропущено '{keyword}' (контекст СОУТ/ОПР)")
+                    continue
+                logger.debug(f"  🚫 Найдено запрещённое: '{keyword}'")
                 return True
+
+        # Проверка 3: Составные фразы (слова рядом)
+        for composite in self.config.get("exclude_composite", []):
+            if self._check_composite(text_lower, composite):
+                # ИСПРАВЛЕНО: если контекст СОУТ/ОПР — не отклонять
+                if has_sout_context and composite.get("check_context", False):
+                    logger.info(f"  ✅ Пропущена составная фраза (контекст СОУТ/ОПР)")
+                    continue
+                logger.debug(f"  🚫 Составная фраза: {composite['words']}")
+                return True
+
         return False
 
-    # =================================================================
-    # === РЕЖИМ ТОЛЬКО ПАРСИНГ (parsing_only=True) ===
-    # =================================================================
+    def _check_composite(self, text: str, composite: dict) -> bool:
+        """Проверяет, находятся ли слова из composite рядом в тексте."""
+        words = composite.get("words", [])
+        max_distance = composite.get("max_distance", 5)
+
+        if len(words) < 2:
+            return False
+
+        text_words = text.split()
+
+        for i, w1 in enumerate(text_words):
+            for word in words:
+                if word in w1:
+                    for other_word in words:
+                        if other_word == word:
+                            continue
+                        for j in range(
+                            max(0, i - max_distance),
+                            min(len(text_words), i + max_distance + 1),
+                        ):
+                            if other_word in text_words[j]:
+                                return True
+
+        return False
 
     def search_and_save(
         self,
@@ -780,9 +761,6 @@ class TenderSearcher:
         max_pages: Optional[int] = None,
         max_results: Optional[int] = None,
     ) -> List[Dict]:
-        """
-        Режим только парсинга: ищет тендеры и сохраняет в JSON/CSV.
-        """
         if not self.parsing_only:
             logger.warning("parsing_only=False, но вызван search_and_save()")
 
@@ -792,6 +770,7 @@ class TenderSearcher:
             f"📋 Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽ (на стороне ЕИС)"
         )
         logger.info(f"📋 Период: {self.config.get('publish_date_days', 14)} дней")
+        logger.info(f"📋 Законы: {self.config.get('laws', [])}")
         logger.info(f"📋 ОКПД2: {self.config.get('okpd2_codes', [])}")
         logger.info(f"{'='*60}")
 
@@ -801,7 +780,6 @@ class TenderSearcher:
             data = tender.to_dict()
             results.append(data)
 
-            # Вывод в консоль
             print(f"\n{'─'*60}")
             print(f"🆔 {tender.tender_id}")
             print(f"📌 {tender.title[:80]}...")
@@ -818,7 +796,6 @@ class TenderSearcher:
             print(f"🔗 {tender.url}")
             print(f"{'─'*60}")
 
-        # Сохранение в файл
         if output_file and results:
             self._save_results(results, output_file)
 
@@ -826,7 +803,6 @@ class TenderSearcher:
         return results
 
     def _save_results(self, results: List[Dict], output_file: str):
-        """Сохраняет результаты в JSON."""
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -836,6 +812,7 @@ class TenderSearcher:
                 "okpd2_ids": self.config.get("okpd2_ids", []),
                 "okpd2_codes": self.config.get("okpd2_codes", []),
                 "min_nmck": self.config.get("min_nmck"),
+                "laws": self.config.get("laws", []),
                 "relevance_keywords": self.config.get("relevance_keywords", []),
             },
             "total": len(results),
@@ -849,17 +826,11 @@ class TenderSearcher:
         print(f"\n💾 Сохранено в: {output_path}")
 
 
-# =================================================================
-# === ФАБРИКА ===
-# =================================================================
-
-
 def create_searcher(
     parsing_only: bool = True,
     proxy: Optional[str] = None,
     config: Optional[Dict] = None,
 ) -> TenderSearcher:
-    """Фабрика поисковика."""
     return TenderSearcher(
         config=config,
         proxy=proxy,
