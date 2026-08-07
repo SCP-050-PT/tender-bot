@@ -1,13 +1,12 @@
 """
 core/risk_rules.py
 Анализ рисков тендера.
-ИСПРАВЛЕНО (26.07.2026 v6.0):
-  - Флаг «НМЦК завышена» (nmck > cost_price × 4)
-  - Принудительный MEDIUM при needs_manual_review
-  - make_decision() учитывает already_submitted
-  - Тип-зависимый min_nmck (из YAML)
-  - Тип-зависимый min_margin_percent
-  - cities_count вместо addresses_count для сложной логистики
+ИСПРАВЛЕНО (29.07.2026 v6.5):
+  - Добавлен guard: recommended_price > nmck → HIGH risk
+  - Добавлен guard: margin_percent > 200% → HIGH risk
+  - Добавлен guard: margin_percent > 100% → MEDIUM risk
+  - Убран парадоксальный флаг "НМЦК сильно выше расчётной"
+  - margin > 30% — НЕ считаем риском (это хорошо)
 """
 
 import re
@@ -57,7 +56,6 @@ def _get_default_risk_rules() -> dict:
             "min_execution_days": 15,
             "min_execution_days_large_volume": 30,
             "min_nmck": 100000,
-            # ← v6.0: Тип-зависимые пороги
             "min_nmck_by_type": {
                 "education": 10000,
                 "sout": 20000,
@@ -72,6 +70,9 @@ def _get_default_risk_rules() -> dict:
                 "opr": 30.0,
                 "combined": 10.0,
             },
+            # ← v6.5: Новые пороги для аномально высокой маржи
+            "max_margin_percent": 200.0,  # Выше = HIGH risk
+            "high_margin_percent": 100.0,  # Выше = MEDIUM risk
         },
         "forbidden_directions": [
             {
@@ -186,14 +187,8 @@ def _get_default_risk_rules() -> dict:
             },
             {
                 "name": "Сложная логистика",
-                "condition": "cities_count > 3",  # ← v6.0: cities_count, не addresses_count
+                "condition": "cities_count > 3",
                 "level": "medium",
-            },
-            # ← v6.0: Новые флаги
-            {
-                "name": "НМЦК сильно выше расчётной цены",
-                "condition": "nmck > cost_price * 4",
-                "level": "high",
             },
             {
                 "name": "Требуется ручная проверка",
@@ -203,6 +198,22 @@ def _get_default_risk_rules() -> dict:
             {
                 "name": "Низкая уверенность ИИ",
                 "condition": "llm_confidence < 0.3",
+                "level": "medium",
+            },
+            # ← v6.5: НОВЫЕ GUARD'ы
+            {
+                "name": "Рекомендуемая цена превышает НМЦК",
+                "condition": "recommended_price > nmck",
+                "level": "high",
+            },
+            {
+                "name": "Аномально высокая маржа",
+                "condition": "margin_percent > max_margin_percent",
+                "level": "high",
+            },
+            {
+                "name": "Высокая маржа — проверьте расчёт",
+                "condition": "margin_percent > high_margin_percent",
                 "level": "medium",
             },
         ],
@@ -260,7 +271,7 @@ class RiskAnalyzer:
         self.forbidden = self.rules["forbidden_directions"]
         self.red_flags_rules = self.rules["red_flags"]
         self.decision_rules = self.rules["decision_rules"]
-        logger.info("RiskAnalyzer инициализирован")
+        logger.info("RiskAnalyzer инициализирован (v6.5)")
 
     def check_forbidden(
         self, tender_text: str, tender_type: Optional[str] = None
@@ -306,23 +317,96 @@ class RiskAnalyzer:
         region_distance: int = 0,
         venue_required: bool = False,
         addresses_count: int = 1,
-        cities_count: int = 1,  # ← v6.0
+        cities_count: int = 1,
         customer_complaint_rate: float = 0.0,
-        needs_manual_review: bool = False,  # ← v6.0
-        llm_confidence: float = 1.0,  # ← v6.0
+        needs_manual_review: bool = False,
+        llm_confidence: float = 1.0,
+        tender_type: Optional[str] = None,
+        recommended_price: float = 0,  # ← v6.5
     ) -> list[dict]:
         """Проверяет красные флаги (риски, но не отказ)."""
         flags = []
-
-        # ← v6.0: Флаг «НМЦК завышена»
-        if cost_price > 0 and nmck > cost_price * 4:
+        # Округляем маржу для избежания float-ошибок
+        margin_percent = round(margin_percent + 0.001, 2)  # ← v6.6-r4: epsilon защита от float-ошибок
+        # ← v6.5: GUARD — цена превышает НМЦК
+        if nmck > 0 and recommended_price > nmck:
             flags.append(
                 {
-                    "name": "НМЦК сильно выше расчётной цены",
+                    "name": "Рекомендуемая цена превышает НМЦК",
                     "level": "high",
-                    "message": f"НМЦК {nmck:,.0f}₽ в {nmck/cost_price:.1f} раз выше расчётной цены {cost_price:,.0f}₽",
+                    "message": f"Рекомендуемая цена {recommended_price:,.0f}₽ превышает НМЦК {nmck:,.0f}₽ — заявка будет отклонена",
                 }
             )
+
+        # ← v6.5: GUARD — аномально высокая маржа
+        if margin_percent > self.thresholds.get("max_margin_percent", 200.0):
+            flags.append(
+                {
+                    "name": "Аномально высокая маржа",
+                    "level": "high",
+                    "message": f"Маржа {margin_percent:.1f}% аномально высокая (порог {self.thresholds.get('max_margin_percent', 200)}%) — проверьте количество и вариант расчёта",
+                }
+            )
+        elif margin_percent > self.thresholds.get("high_margin_percent", 100.0):
+            flags.append(
+                {
+                    "name": "Высокая маржа — проверьте расчёт",
+                    "level": "medium",
+                    "message": f"Маржа {margin_percent:.1f}% выше нормы (порог {self.thresholds.get('high_margin_percent', 100)}%) — проверьте корректность",
+                }
+            )
+
+        # ← v6.5: НОВАЯ ЛОГИКА НМЦК vs себестоимость
+        if cost_price > 0 and nmck > 0:
+            actual_margin_pct = ((nmck - cost_price) / cost_price) * 100
+            cost_to_nmck_ratio = cost_price / nmck
+
+            # Проверяем: НМЦК ниже себестоимости (это реальный риск)
+            if cost_price > nmck * 1.2:
+                flags.append(
+                    {
+                        "name": "НМЦК ниже рынка",
+                        "level": "medium",
+                        "message": f"Себестоимость {cost_price:,.0f}₽ на {(cost_price/nmck - 1)*100:.0f}% выше НМЦК {nmck:,.0f}₽ — возможно договорная закупка",
+                    }
+                )
+
+            # НМЦК выше себестоимости — НЕ риск, если маржа хорошая
+            elif nmck > cost_price * 4:
+                is_sout = tender_type and tender_type.lower() in (
+                    "sout",
+                    "соут",
+                    "combined",
+                    "комбинированный",
+                )
+
+                if is_sout and cost_to_nmck_ratio < 0.25:
+                    logger.info(
+                        f"[v6.5] СОУТ: НМЦК {nmck:,.0f}₽, себестоимость {cost_price:,.0f}₽ "
+                        f"(маржа {actual_margin_pct:.0f}%) — НЕ риск"
+                    )
+                elif actual_margin_pct > 30:
+                    logger.info(
+                        f"[v6.5] Хорошая маржа {actual_margin_pct:.1f}% — не считаем риском"
+                    )
+                else:
+                    flags.append(
+                        {
+                            "name": "НМЦК значительно выше себестоимости",
+                            "level": "medium",
+                            "message": f"НМЦК {nmck:,.0f}₽ в {nmck/cost_price:.1f} раза выше себестоимости {cost_price:,.0f}₽ (маржа {actual_margin_pct:.1f}%) — проверьте корректность расчёта",
+                        }
+                    )
+
+            # НМЦК на грани себестоимости (маржа < 10%)
+            elif cost_to_nmck_ratio > 0.85:
+                flags.append(
+                    {
+                        "name": "НМЦК на грани себестоимости",
+                        "level": "high",
+                        "message": f"Себестоимость {cost_price:,.0f}₽ = {cost_to_nmck_ratio*100:.1f}% от НМЦК {nmck:,.0f}₽ — минимальная маржа",
+                    }
+                )
 
         if margin_percent < self.thresholds["min_margin_percent"]:
             flags.append(
@@ -342,11 +426,13 @@ class RiskAnalyzer:
                 }
             )
 
-        if deadline_days > 0:
-            if (
-                volume_large
-                and deadline_days < self.thresholds["min_execution_days_large_volume"]
-            ):
+            # ← v6.7-fix: min_days_large инициализируем ДО проверки deadline_days
+        min_days_large = self.thresholds.get("min_execution_days_large_volume", 30)
+        if tender_type and tender_type.lower() in ("education", "обучение"):
+            min_days_large = 7
+
+        if deadline_days and deadline_days > 0:
+            if volume_large and deadline_days < min_days_large:
                 flags.append(
                     {
                         "name": "Сжатые сроки",
@@ -389,7 +475,6 @@ class RiskAnalyzer:
                 }
             )
 
-        # ← v6.0: cities_count вместо addresses_count
         if cities_count > 3:
             flags.append(
                 {
@@ -399,7 +484,6 @@ class RiskAnalyzer:
                 }
             )
 
-        # ← v6.0: Флаг «Требуется ручная проверка»
         if needs_manual_review:
             flags.append(
                 {
@@ -409,7 +493,6 @@ class RiskAnalyzer:
                 }
             )
 
-        # ← v6.0: Флаг «Низкая уверенность ИИ»
         if llm_confidence < 0.3:
             flags.append(
                 {
@@ -451,30 +534,30 @@ class RiskAnalyzer:
         risk_level: str,
         nmck: float,
         already_submitted: bool = False,
-        needs_manual_review: bool = False,  # ← v6.0
-        tender_type: Optional[str] = None,  # ← v6.0
+        needs_manual_review: bool = False,
+        tender_type: Optional[str] = None,
     ) -> Literal["рекомендуется", "не участвуем", "подано"]:
         """Принимает финальное решение по участию."""
-        # ← v6.0: already_submitted
         if already_submitted:
             return "подано"
 
         if not is_allowed:
             return "не участвуем"
 
-        # ← v6.0: Тип-зависимый min_margin_percent
         min_margin = self.thresholds.get("min_margin_percent", 10.0)
         if tender_type:
             type_margins = self.thresholds.get("min_margin_by_type", {})
             min_margin = type_margins.get(tender_type.lower(), min_margin)
 
+        margin_percent = round(
+            margin_percent + 0.001, 2
+        )  # ← v6.6-r4: epsilon защита от float-ошибок
         if margin_percent < min_margin:
             return "не участвуем"
 
         if risk_level == "high":
             return "не участвуем"
 
-        # ← v6.0: Тип-зависимый min_nmck
         min_nmck = self.thresholds.get("min_nmck", 100000)
         if tender_type:
             type_nmcks = self.thresholds.get("min_nmck_by_type", {})
@@ -483,7 +566,6 @@ class RiskAnalyzer:
         if nmck < min_nmck:
             return "не участвуем"
 
-        # ← v6.0: При needs_manual_review — риск MEDIUM минимум
         if needs_manual_review and risk_level == "low":
             risk_level = "medium"
 
@@ -500,12 +582,13 @@ class RiskAnalyzer:
         region_distance: int = 0,
         venue_required: bool = False,
         addresses_count: int = 1,
-        cities_count: int = 1,  # ← v6.0
+        cities_count: int = 1,
         customer_complaint_rate: float = 0.0,
         already_submitted: bool = False,
         tender_type: Optional[str] = None,
-        needs_manual_review: bool = False,  # ← v6.0
-        llm_confidence: float = 1.0,  # ← v6.0
+        needs_manual_review: bool = False,
+        llm_confidence: float = 1.0,
+        recommended_price: float = 0,  # ← v6.5
     ) -> RiskResult:
         """Полный анализ рисков тендера."""
         forbidden = self.check_forbidden(tender_text, tender_type)
@@ -520,17 +603,18 @@ class RiskAnalyzer:
             region_distance=region_distance,
             venue_required=venue_required,
             addresses_count=addresses_count,
-            cities_count=cities_count,  # ← v6.0
+            cities_count=cities_count,
             customer_complaint_rate=customer_complaint_rate,
-            needs_manual_review=needs_manual_review,  # ← v6.0
-            llm_confidence=llm_confidence,  # ← v6.0
+            needs_manual_review=needs_manual_review,
+            llm_confidence=llm_confidence,
+            tender_type=tender_type,
+            recommended_price=recommended_price,  # ← v6.5
         )
 
         risk_level = self.determine_risk_level(flags_data)
         if not is_allowed:
             risk_level = "high"
 
-        # ← v6.0: При needs_manual_review — принудительно MEDIUM минимум
         if needs_manual_review and risk_level == "low":
             risk_level = "medium"
 
@@ -540,8 +624,8 @@ class RiskAnalyzer:
             risk_level=risk_level,
             nmck=nmck,
             already_submitted=already_submitted,
-            needs_manual_review=needs_manual_review,  # ← v6.0
-            tender_type=tender_type,  # ← v6.0
+            needs_manual_review=needs_manual_review,
+            tender_type=tender_type,
         )
 
         red_flags = [f["message"] for f in flags_data]

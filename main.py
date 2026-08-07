@@ -4,13 +4,15 @@ main.py
 Интеграционный скрипт TENDER-BOT v2.
 Пайплайн: Поиск → Детальный парсинг → LLM-анализ → Расчёт → Риски → Google Sheets
 
-ИСПРАВЛЕНО (27.07.2026 v6.2):
-  - БАГ 1: Передача tender_type_hint в analyzer для корректного определения типа
-  - v6.0: Передача cities_count вместо addresses_count для СОУТ (БАГ 9.1)
-  - v6.0: Передача v5.4 параметров: trip_days, is_seasonal, opr_positions, opr_persons (БАГ 9.2)
-  - v6.0: _get_quantity() без addresses_count (БАГ 9.3)
-  - v6.0: Колонки needs_manual_review, llm_confidence в Sheets (БАГ 9.5)
-  - v6.0: Приоритизация документов перед обрезкой (БАГ 9.6)
+ИСПРАВЛЕНО (31.07.2026 v6.6-r2):
+  - Импорты обновлены под рефакторинг:
+    * core.searcher → core.search
+    * core.detailed_parser → core.parsers
+    * core.analyzer → core.analysis
+  - Удалён мёртвый импорт get_url_builder (tender.url уже содержит URL)
+  - Удалён мёртвый импорт get_type_detector (не используется в main.py)
+  - Упрощён _build_sheets_row(): используется tender.url
+  - Убраны isinstance(dict) проверки для cities_count/addresses_count
 """
 
 import sys
@@ -47,42 +49,23 @@ except ImportError:
     logger = logging.getLogger("tender_bot")
 
 
-# === КОЛОНКИ ТАБЛИЦЫ ЗАКАЗЧИЦЫ (лист "Тендера 2026 ИИ-бот") ===
-# ← v6.0: Добавлены колонки needs_manual_review, llm_confidence
-SHEET_COLUMNS = [
-    "ID тендера",  # A
-    "Наименование услуг",  # B
-    "Количество",  # C
-    "Способ проведения закупки",  # D
-    "НМЦК",  # E
-    "Ссылка на тендер",  # F
-    "ЭТП",  # G
-    "Регион",  # H
-    "Обеспечение заявки",  # I
-    "Обеспечение контракта",  # J
-    "Способ обеспечения исполнения",  # K
-    "Срок подачи заявки до",  # L
-    "Решение по участию",  # M
-    "Цена предложения",  # N
-    "Результат",  # O — бот не трогает
-    "Дата заключения контракта",  # P — бот не трогает
-    "Дата выполнения работ",  # Q — бот не трогает
-    "Комментарии руководителя отдела по участию",  # R — бот не трогает
-    "Ручная проверка",  # S ← v6.0
-    "Уверенность ИИ",  # T ← v6.0
-]
+# ← v6.6-r2: Обновлённые импорты под рефакторинг
+from core.google_sheets import SHEET_COLUMNS
+from utils.price_parser import (
+    format_for_sheets as _format_nmck,
+    format_for_sheets as _format_price,
+)
 
+# ← v6.6-r2: Удалён: from utils.url_builder import get_url_builder (мёртвый код)
+#            tender.url уже содержит правильный URL от SearchUrlBuilder
 
-def _format_nmck(nmck: float) -> str:
-    if not nmck or nmck == 0:
-        return ""
-    return f"{nmck:,.2f}".replace(",", " ").replace(".", ",")
+# ← v6.6-r2: Удалён: from core.tender_type import get_type_detector
+#            Не используется в main.py (Singleton в analyzer.py)
 
-
-def _format_price(price: float) -> str:
-    if not price or price == 0:
-        return ""
-    return f"{price:,.2f}".replace(",", " ").replace(".", ",")
+# ← v6.6-r2: Обновлённые импорты
+from core.search import create_searcher                    # было: core.searcher
+from core.parsers import DetailedParser                    # было: core.detailed_parser
+from core.analysis import TenderAnalyzer                   # было: core.analyzer
 
 
 def _build_tender_text(detail, documents_text: str) -> str:
@@ -91,6 +74,7 @@ def _build_tender_text(detail, documents_text: str) -> str:
         f"ЗАКАЗЧИК: {detail.customer_name or 'не указан'}",
         f"РЕГИОН: {detail.customer_region or 'не указан'}",
         f"АДРЕС ЗАКАЗЧИКА: {detail.customer_address or 'не указан'}",
+        f"МЕСТО ПОСТАВКИ: {detail.delivery_address or 'не указано'}",
         f"НМЦК: {detail.nmck:,.2f} ₽" if detail.nmck else "НМЦК: не указана",
         f"СПОСОБ ЗАКУПКИ: {detail.purchase_method or 'не указан'}",
         f"ЭТП: {detail.platform_name or 'не указана'}",
@@ -99,11 +83,11 @@ def _build_tender_text(detail, documents_text: str) -> str:
         f"ОБЕСПЕЧЕНИЕ ЗАЯВКИ: {detail.application_guarantee or 'не указано'}",
         f"ОБЕСПЕЧЕНИЕ КОНТРАКТА: {detail.contract_guarantee or 'не указано'}",
         f"АДРЕСОВ ПОСТАВКИ: {detail.addresses_count or 0}",
+        f"ГОРОДОВ ПОСТАВКИ: {detail.cities_count or 0}",
+        f"РЕГИОНОВ ПОСТАВКИ: {detail.regions_count or 1}",  # ← v6.6-r2: добавлено
     ]
 
-    # ← v6.0: Приоритизация документов перед обрезкой
     if documents_text and len(documents_text) > 100:
-        # Сортируем документы: ТЗ первым, контракты — в конец
         prioritized_text = _prioritize_documents(documents_text)
         parts.append(f"ТЕКСТ ДОКУМЕНТОВ (ТЗ, извещение): {prioritized_text[:12000]}")
     else:
@@ -111,7 +95,6 @@ def _build_tender_text(detail, documents_text: str) -> str:
     return "\n".join(parts)
 
 
-# ← v6.0: Приоритизация документов
 def _prioritize_documents(documents_text: str) -> str:
     """Сортирует документы по приоритету: ТЗ > извещение > КД > прочее > контракты."""
     lines = documents_text.split("\n")
@@ -126,7 +109,7 @@ def _prioritize_documents(documents_text: str) -> str:
         elif any(kw in lower for kw in ["квалификационные", "требования", "критерии"]):
             score = 60
         elif any(kw in lower for kw in ["контракт", "договор", "проект контракта"]):
-            score = 10  # Контракты — в конец
+            score = 10
         priority_scores.append((score, line))
 
     priority_scores.sort(key=lambda x: x[0], reverse=True)
@@ -134,7 +117,7 @@ def _prioritize_documents(documents_text: str) -> str:
 
 
 def _get_quantity(analysis) -> int:
-    """← v6.0: Убран addresses_count из fallback."""
+    """Извлекает количество из анализа."""
     if not hasattr(analysis, "details") or analysis.details is None:
         return 1
 
@@ -145,7 +128,6 @@ def _get_quantity(analysis) -> int:
             details.get("rm_total")
             or details.get("points_count")
             or details.get("students_count")
-            # ← v6.0: Убрано details.get("addresses_count")
             or 1
         )
         return int(quantity) if quantity else 1
@@ -154,25 +136,31 @@ def _get_quantity(analysis) -> int:
         getattr(details, "rm_total", None)
         or getattr(details, "points_count", None)
         or getattr(details, "students_count", None)
-        # ← v6.0: Убрано getattr(details, "addresses_count", None)
         or 1
     )
     return int(quantity) if quantity else 1
 
 
 def _get_guarantee_info(detail, analysis) -> tuple:
+    """Извлекает информацию об обеспечении."""
     app_guarantee = ""
     contract_guarantee = ""
     guarantee_method = ""
 
+    # Приоритет: detail (HTML-парсинг)
     if detail:
-        if detail.application_guarantee:
-            app_guarantee = detail.application_guarantee
-        if detail.contract_guarantee:
-            contract_guarantee = detail.contract_guarantee
-        if detail.guarantee_method:
-            guarantee_method = detail.guarantee_method
+        raw_app = (detail.application_guarantee or "").strip()
+        raw_contract = (detail.contract_guarantee or "").strip()
+        raw_method = (detail.guarantee_method or "").strip()
 
+        if raw_app:
+            app_guarantee = raw_app
+        if raw_contract:
+            contract_guarantee = raw_contract
+        if raw_method:
+            guarantee_method = raw_method
+
+    # Fallback: analysis.details (LLM-результат)
     if analysis and hasattr(analysis, "details") and analysis.details:
         details = analysis.details
         if isinstance(details, dict):
@@ -190,27 +178,33 @@ def _get_guarantee_info(detail, analysis) -> tuple:
             if not guarantee_method and getattr(details, "guarantee_method", None):
                 guarantee_method = details.guarantee_method
 
+    # Fallback: requirements
     if detail and detail.requirements and not app_guarantee:
         req_lower = detail.requirements.lower()
         if "не требуется" in req_lower:
-            app_guarantee = "не требуется"
-            contract_guarantee = "не требуется"
+            app_guarantee = "Не требуется"
+            contract_guarantee = "Не требуется"
 
-    if (
-        analysis
-        and hasattr(analysis, "comment")
-        and analysis.comment
-        and not app_guarantee
-    ):
+    # Fallback: comment
+    if analysis and hasattr(analysis, "comment") and analysis.comment and not app_guarantee:
         comment_lower = analysis.comment.lower()
         if "не требуется" in comment_lower:
-            app_guarantee = "не требуется"
-            contract_guarantee = "не требуется"
+            app_guarantee = "Не требуется"
+            contract_guarantee = "Не требуется"
+
+    # Критичный fix: если пусто — "Не требуется"
+    if not app_guarantee:
+        app_guarantee = "Не требуется"
+    if not contract_guarantee:
+        contract_guarantee = "Не требуется"
+    if not guarantee_method:
+        guarantee_method = "Не требуется"
 
     return app_guarantee, contract_guarantee, guarantee_method
 
 
 def _build_sheets_row(analysis, detail, tender) -> dict:
+    """Формирует строку для Google Sheets."""
     quantity = _get_quantity(analysis)
     app_guarantee, contract_guarantee, guarantee_method = _get_guarantee_info(
         detail, analysis
@@ -222,27 +216,10 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     else:
         procurement = law
 
-    tender_url = ""
-    if detail and detail.common_info_url:
-        tender_url = detail.common_info_url
-    elif hasattr(tender, "url") and tender.url:
-        tender_url = tender.url
-    else:
-        law_num = tender.law.replace("-FZ", "") if tender.law else "44"
-        if law_num == "44":
-            tender_url = (
-                f"https://zakupki.gov.ru/epz/order/notice/ea20/view/common-info.html"
-                f"?regNumber={tender.tender_id}"
-            )
-        elif law_num == "223":
-            tender_url = (
-                f"https://zakupki.gov.ru/epz/order/extendedsearch/results.html"
-                f"?searchString={tender.tender_id}"
-            )
-        else:
-            tender_url = f"https://zakupki.gov.ru/epz/order/notice/notice{law_num}/common-info.html?regNumber={tender.tender_id}"
+    # ← v6.6-r2: Используем tender.url (уже содержит правильный URL от SearchUrlBuilder)
+    # Удалён мёртвый код с get_url_builder()
+    tender_url = tender.url
 
-    # ← v6.0: Добавляем needs_manual_review и llm_confidence
     needs_manual = getattr(analysis, "needs_manual_review", False)
     llm_conf = getattr(analysis, "llm_confidence", 0.0)
 
@@ -271,18 +248,18 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
             if hasattr(analysis, "_format_comment")
             else analysis.comment
         ),
-        "Ручная проверка": "ДА" if needs_manual else "НЕТ",  # ← v6.0
-        "Уверенность ИИ": f"{llm_conf:.2f}" if llm_conf > 0 else "",  # ← v6.0
+        "Ручная проверка": "ДА" if needs_manual else "НЕТ",
+        "Уверенность ИИ": f"{llm_conf:.2f}" if llm_conf > 0 else "",
     }
 
 
 def run_parse_only(max_pages: int = None, max_results: int = None):
+    """Режим только парсинга (без LLM)."""
     logger.info("=" * 60)
     logger.info("🔍 РЕЖИМ: Только парсинг (без LLM)")
     logger.info("=" * 60)
 
-    from core.searcher import create_searcher
-
+    # ← v6.6-r2: Обновлённый импорт
     searcher = create_searcher(parsing_only=True)
 
     output_file = f"data/search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -300,14 +277,12 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
 def run_analyze(
     max_pages: int = None, max_results: int = None, skip_detail: bool = False
 ):
+    """Полный анализ с LLM."""
     logger.info("=" * 60)
     logger.info("🤖 РЕЖИМ: Полный анализ с LLM")
     logger.info("=" * 60)
 
     from config.settings import settings
-    from core.searcher import create_searcher
-    from core.analyzer import TenderAnalyzer
-    from core.detailed_parser import DetailedParser
     from core.tender_cache import TenderCache
 
     errors = settings.validate()
@@ -317,6 +292,7 @@ def run_analyze(
             logger.error(f"   • {err}")
         sys.exit(1)
 
+    # ← v6.6-r2: Обновлённые импорты
     searcher = create_searcher(parsing_only=False)
     analyzer = TenderAnalyzer()
 
@@ -356,7 +332,7 @@ def run_analyze(
     sheets_rows = []
 
     for tender in searcher.search(max_pages=max_pages, max_results=max_results):
-        logger.info(f"\n{'─' * 60}")
+        logger.info(f"\n{'-' * 60}")
         logger.info(f"🆔 {tender.tender_id} | {tender.law}")
         logger.info(f"📌 {tender.title[:80]}...")
         logger.info(
@@ -433,71 +409,63 @@ def run_analyze(
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
                     "platform_name": detail.platform_name or "",
                     "requirements": detail.requirements or "",
-                    "application_guarantee": detail.application_guarantee or "",
-                    "contract_guarantee": detail.contract_guarantee or "",
+                    "application_guarantee": (detail.application_guarantee or "").strip(),
+                    "contract_guarantee": (detail.contract_guarantee or "").strip(),
+                    "guarantee_method": (detail.guarantee_method or "").strip(),
                 }
 
-                # ← v6.0: cities_count для СОУТ (уникальные города)
-                # addresses_count — для обучения всегда 1 (или из ТЗ)
-                tender_type_lower = (detail.tender_type or "").lower()
-                is_sout_or_combined = tender_type_lower in (
-                    "sout",
-                    "combined",
-                    "соут",
-                    "комбинированный",
-                )
+                # ← v6.6-r2: Упрощённая логика cities_count/regions_count
+                # AddressParser теперь возвращает int, не dict
+                tender_info["cities_count"] = detail.cities_count or 1
+                tender_info["regions_count"] = detail.regions_count or 1
+                tender_info["addresses_count"] = detail.addresses_count or 1
 
-                # Fallback: если тип не определён — проверяем по расширенным ключевым словам
+                # Для СОУТ/combined: логика выездов
+                tender_type_lower = (detail.tender_type or "").lower()
+                is_sout = tender_type_lower in ("sout", "combined", "соут", "комбинированный")
+
                 if not tender_type_lower:
                     name_lower = (detail.purchase_name or "").lower()
-                    is_sout_or_combined = any(
+                    is_sout = any(
                         kw in name_lower
                         for kw in [
-                            "соут",
-                            "специальная оценка условий труда",
-                            "специальная оценка труда",
-                            "оценка условий труда",
-                            "оценка рабочих мест",
+                            "соут", "специальная оценка условий труда",
+                            "оценка условий труда", "оценка рабочих мест",
                             "специальная оценка",
                         ]
                     )
 
-                if is_sout_or_combined:
-                    tender_info["cities_count"] = (
-                        getattr(detail, "cities_count", detail.addresses_count) or 1
-                    )
-                    tender_info["addresses_count"] = 1  # Для обратной совместимости
+                if is_sout:
                     logger.info(
-                        f"[v6.1] Передано cities_count={tender_info['cities_count']} для СОУТ/combined"
+                        f"[v6.6-r2] СОУТ/combined: cities={detail.cities_count}, "
+                        f"regions={detail.regions_count}, addresses={detail.addresses_count}"
                     )
-                else:
-                    tender_info["addresses_count"] = detail.addresses_count or 1
-                # v5.2: Параметры из Detail напрямую
-                if detail.students_count > 0:
-                    tender_info["students_count"] = detail.students_count
+
+                # Для обучения: 1 площадка = 1 адрес
+                if detail.tender_type == "education":
+                    tender_info["addresses_count"] = 1
+
+                # Параметры из Detail с приоритетом КТРУ
                 if detail.rm_total > 0:
                     tender_info["rm_total"] = detail.rm_total
+                    tender_info["rm_total_source"] = "ktru"
+                if detail.students_count > 0:
+                    tender_info["students_count"] = detail.students_count
+                    tender_info["students_count_source"] = "ktru"
                 if detail.points_count > 0:
                     tender_info["points_count"] = detail.points_count
 
-                # v5.2: Очные параметры
+                # Очные параметры
                 if detail.has_full_time:
                     tender_info["has_full_time"] = True
                     tender_info["is_distance"] = False
-                    if detail.teacher_days > 0:
-                        tender_info["teacher_days"] = detail.teacher_days
-                    if detail.accommodation_nights > 0:
-                        tender_info["accommodation_nights"] = (
-                            detail.accommodation_nights
-                        )
-                    if detail.transport_km > 0:
-                        tender_info["transport_km"] = detail.transport_km
-                    if detail.venue_rent_days > 0:
-                        tender_info["venue_rent_days"] = detail.venue_rent_days
-                    if detail.manikin_days > 0:
-                        tender_info["manikin_days"] = detail.manikin_days
+                for field in ["teacher_days", "accommodation_nights", "transport_km",
+                              "venue_rent_days", "manikin_days"]:
+                    val = getattr(detail, field, 0) or 0
+                    if val > 0:
+                        tender_info[field] = val
 
-                # ← v6.0: v5.4 параметры (БАГ 9.2)
+                # Дополнительные параметры
                 if detail.trip_days > 0:
                     tender_info["trip_days"] = detail.trip_days
                 tender_info["is_seasonal"] = getattr(detail, "is_seasonal", False)
@@ -505,16 +473,7 @@ def run_analyze(
                     tender_info["opr_positions"] = detail.opr_positions
                 if detail.opr_persons > 0:
                     tender_info["opr_persons"] = detail.opr_persons
-
-                tender_info["cities_count"] = (
-                    getattr(detail, "cities_count", detail.addresses_count) or 1
-                )
-
-                # Для обучения: 1 площадка = 1 адрес (логика из _count_addresses)
-                if detail.tender_type == "education":
-                    tender_info["addresses_count"] = 1
-                else:
-                    tender_info["addresses_count"] = detail.addresses_count or 1
+                tender_info["needs_subcontractor"] = getattr(detail, "needs_subcontractor", False)
 
             # === DEBUG LOG ===
             logger.info(
@@ -523,19 +482,8 @@ def run_analyze(
                 f"text_length={len(tender_text)}, "
                 f"students_count={tender_info.get('students_count', 'N/A')}, "
                 f"rm_total={tender_info.get('rm_total', 'N/A')}, "
-                f"points_count={tender_info.get('points_count', 'N/A')}, "
-                f"teacher_days={tender_info.get('teacher_days', 'N/A')}, "
-                f"accommodation_nights={tender_info.get('accommodation_nights', 'N/A')}, "
-                f"transport_km={tender_info.get('transport_km', 'N/A')}, "
-                f"venue_rent_days={tender_info.get('venue_rent_days', 'N/A')}, "
-                f"manikin_days={tender_info.get('manikin_days', 'N/A')}, "
-                f"trip_days={tender_info.get('trip_days', 'N/A')}, "  # ← v6.0
-                f"is_seasonal={tender_info.get('is_seasonal', 'N/A')}, "  # ← v6.0
-                f"opr_positions={tender_info.get('opr_positions', 'N/A')}, "  # ← v6.0
-                f"opr_persons={tender_info.get('opr_persons', 'N/A')}, "  # ← v6.0
-                f"cities_count={tender_info.get('cities_count', 'N/A')}"  # ← v6.0
+                f"regions_count={tender_info.get('regions_count', 'N/A')}"
             )
-            # === END DEBUG ===
 
             analysis = analyzer.analyze(
                 tender_text=tender_text,
@@ -555,10 +503,9 @@ def run_analyze(
                 f"cost_price={analysis.cost_price}, "
                 f"recommended_price={analysis.recommended_price}, "
                 f"margin_percent={analysis.margin_percent}, "
-                f"needs_manual_review={getattr(analysis, 'needs_manual_review', 'N/A')}, "  # ← v6.0
-                f"llm_confidence={getattr(analysis, 'llm_confidence', 'N/A')}"  # ← v6.0
+                f"needs_manual_review={getattr(analysis, 'needs_manual_review', 'N/A')}, "
+                f"llm_confidence={getattr(analysis, 'llm_confidence', 'N/A')}"
             )
-            # === END DEBUG ===
 
             result_dict = analysis.to_dict()
             results.append(result_dict)
@@ -590,13 +537,13 @@ def run_analyze(
             print(f"Рекомендуемая цена: {analysis.recommended_price:,.0f} ₽")
             print(f"Маржа: {analysis.margin_percent:.1f}%")
             print(f"Риск: {analysis.risk_level} | Решение: {analysis.decision}")
-            if getattr(analysis, "needs_manual_review", False):  # ← v6.0
+            if getattr(analysis, "needs_manual_review", False):
                 print(f"⚠️ ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
             if detail and detail.customer_region:
                 print(f"Регион: {detail.customer_region}")
             if detail and detail.platform_name:
                 print(f"ЭТП: {detail.platform_name}")
-            print(f"{'─' * 60}")
+            print(f"{'-' * 60}")
             print(f"Комментарий:")
             comment = analysis.comment
             print(comment[:400] + "..." if len(comment) > 400 else comment)
@@ -662,8 +609,8 @@ def run_analyze(
 
 
 def run_interactive():
+    """Интерактивный режим."""
     from config.settings import settings
-    from core.analyzer import TenderAnalyzer
 
     errors = settings.validate()
     if errors:
@@ -672,6 +619,7 @@ def run_interactive():
             logger.error(f"   • {err}")
         sys.exit(1)
 
+    # ← v6.6-r2: Обновлённый импорт
     analyzer = TenderAnalyzer()
 
     print("\n" + "=" * 60)
@@ -710,9 +658,9 @@ def run_interactive():
         print(f"Маржа: {result_dict['margin_percent']:.1f}%")
         print(f"Риск: {result_dict['risk_level']}")
         print(f"Решение: {result_dict['decision']}")
-        if result_dict.get("needs_manual_review"):  # ← v6.0
+        if result_dict.get("needs_manual_review"):
             print("⚠️ ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
-        if result_dict.get("llm_confidence"):  # ← v6.0
+        if result_dict.get("llm_confidence"):
             print(f"Уверенность ИИ: {result_dict['llm_confidence']:.2f}")
         print("-" * 60)
         print("Риски:")
@@ -735,7 +683,7 @@ def main():
 Примеры:
   python main.py --parse-only --max-results 10        # Только поиск
   python main.py --analyze --max-pages 2               # Полный анализ
-  python main.py --analyze --skip-detail               # Быстрый анализ (без парсинга документов)
+  python main.py --analyze --skip-detail               # Быстрый анализ
   python main.py --interactive                       # Ручной ввод
   python main.py --test                              # Тест калькулятора
         """,

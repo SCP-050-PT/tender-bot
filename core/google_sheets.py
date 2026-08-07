@@ -37,16 +37,17 @@ SHEET_COLUMNS = [
     "Регион",  # H
     "Обеспечение заявки",  # I
     "Обеспечение контракта",  # J
-    "Способ обеспечения исполнения",  # K ← v6.0: исправлена опечатка
+    "Способ обеспечения исполнения",  # K
     "Срок подачи заявки до",  # L
-    "Решение по участию",  # M
+    "Решение по участию",  # M ← ручное, бот НЕ заполняет
     "Цена предложения",  # N
-    "Результат",  # O
-    "Дата заключения контракта",  # P
-    "Дата выполнения работ",  # Q
-    "Комментарии руководителя отдела по участию",  # R
-    "Ручная проверка",  # S ← v6.0
-    "Уверенность ИИ",  # T ← v6.0
+    "Результат",  # O ← ручное, бот НЕ заполняет
+    "Дата заключения контракта",  # P ← ручное, бот НЕ заполняет
+    "Дата выполнения работ",  # Q ← ручное, бот НЕ заполняет
+    "Комментарий от ИИ-агента",  # R
+    "Ручная проверка",  # S
+    "Уверенность ИИ",  # T
+    "Комментарии руководителя отдела по участию",  # U ← v6.5: новая, ручная
 ]
 
 # ← v6.0: Расширен диапазон с A:N до A:T (20 колонок)
@@ -140,6 +141,26 @@ class GoogleSheetsManager:
             return False, "client_email невалиден"
 
         return True, "OK"
+    
+    def ensure_headers(self) -> bool:
+        """Проверяет и обновляет заголовки первой строки."""
+        try:
+            current_headers = self.worksheet.row_values(1)
+
+            # Если заголовки уже правильные — ничего не делаем
+            if current_headers == SHEET_COLUMNS:
+                logger.info("✅ Заголовки актуальны")
+                return True
+
+            # Иначе — перезаписываем
+            end_col = self._col_index_to_letter(len(SHEET_COLUMNS))
+            self.worksheet.update(f"A1:{end_col}1", [SHEET_COLUMNS])
+            logger.info(f"✅ Заголовки обновлены: {len(SHEET_COLUMNS)} колонок")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка обновления заголовков: {e}")
+            return False
 
     def _connect(self):
         """Устанавливает соединение с Google Sheets с детальным логированием."""
@@ -177,6 +198,7 @@ class GoogleSheetsManager:
 
             try:
                 self.worksheet = self.sheet.worksheet(self.worksheet_name)
+                self.ensure_headers()
             except gspread.WorksheetNotFound:
                 error_msg = (
                     f'Лист "{self.worksheet_name}" НЕ НАЙДЕН. '
@@ -265,7 +287,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:T{row_number}",
+                f"A{row_number}:U{row_number}",
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
         except Exception as e:
@@ -275,7 +297,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:T{row_number}",
+                f"A{row_number}:U{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
@@ -285,7 +307,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:T{row_number}",
+                f"A{row_number}:U{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
@@ -309,6 +331,9 @@ class GoogleSheetsManager:
 
 
 _sheets_manager: Optional[GoogleSheetsManager] = None
+
+
+
 
 
 def get_sheets_manager() -> GoogleSheetsManager:

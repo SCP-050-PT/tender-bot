@@ -1,0 +1,364 @@
+"""
+Экстрактор текста из Excel файлов (XLSX / XLS).
+Багфиксы v6.6-r2:
+  - Корректное извлечение количества из «Обоснования НМЦК»
+  - Поиск количества даже без колонки «услуга»
+  - Фильтрация фантомных чисел (телефоны, адреса)
+"""
+
+import re
+from pathlib import Path
+from typing import List, Tuple, Optional
+from loguru import logger
+
+from core.config.document_config import (
+    QUANTITY_COLUMN_KEYWORDS,
+    SERVICE_ROW_KEYWORDS,
+    NMCK_FILE_KEYWORDS,
+)
+from core.extractors.base_extractor import BaseExtractor
+
+try:
+    import openpyxl
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
+
+try:
+    import xlrd
+    HAS_XLRD = True
+except ImportError:
+    HAS_XLRD = False
+
+
+class ExcelExtractor(BaseExtractor):
+    """Извлекает текст из Excel файлов со структурированными данными."""
+
+    SUPPORTED_EXTENSIONS = ["xlsx", "xls"]
+
+    # Паттерны фантомных чисел (телефоны, ИНН, КПП, адреса)
+    PHANTOM_PATTERNS = [
+        re.compile(r"^\+?\d[\d\s\-()]{7,15}$"),  # телефон
+        re.compile(r"^\d{10,12}$"),  # ИНН/КПП/ОГРН
+        re.compile(r"^\d{6}$"),  # почтовый индекс
+        re.compile(r"^\d{1,3}[-/]\d{1,3}$"),  # дроби типа 12/34
+    ]
+
+    def extract(self, file_path: Path, doc_name: str = "") -> str:
+        is_xlsx, is_xls = self._detect_format(file_path)
+
+        if HAS_OPENPYXL and is_xlsx:
+            return self._extract_structured_openpyxl(file_path, doc_name)
+        elif HAS_XLRD and is_xls:
+            return self._extract_structured_xlrd(file_path, doc_name)
+        else:
+            logger.warning(f"[ExcelExtractor] Нет библиотеки для {file_path.suffix}")
+            return self._extract_fallback(file_path)
+
+    def _detect_format(self, file_path: Path) -> Tuple[bool, bool]:
+        """Определяет формат Excel по магическим байтам и расширению."""
+        is_xlsx = False
+        is_xls = False
+
+        with open(file_path, "rb") as f:
+            header = f.read(8)
+            if header.startswith(b"\x50\x4b\x03\x04"):
+                is_xlsx = True
+            elif header.startswith(b"\xd0\xcf\x11\xe0"):
+                is_xls = True
+
+        # Fallback на расширение
+        suffix = file_path.suffix.lower()
+        if not is_xlsx and not is_xls:
+            if suffix == ".xlsx":
+                is_xlsx = True
+            elif suffix == ".xls":
+                is_xls = True
+
+        return is_xlsx, is_xls
+
+    def _extract_structured_openpyxl(self, file_path: Path, doc_name: str) -> str:
+        """Извлекает XLSX со структурированными данными."""
+        try:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            all_texts = []
+            extracted_quantities = []  # Найденные количества для приоритизации
+
+            for sheet in wb.worksheets:
+                sheet_texts, quantities = self._process_sheet_openpyxl(sheet, doc_name)
+                all_texts.extend(sheet_texts)
+                extracted_quantities.extend(quantities)
+
+            # Добавляем найденные количества в начало
+            if extracted_quantities:
+                prefix = "\n".join(
+                    f"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = {q} ==="
+                    for q in extracted_quantities[:5]  # max 5
+                )
+                all_texts.insert(0, prefix)
+
+            result = "\n".join(all_texts)
+            logger.info(
+                f"[ExcelExtractor] XLSX извлечён: {len(all_texts)} строк, "
+                f"количеств найдено: {len(extracted_quantities)}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[ExcelExtractor] Ошибка openpyxl: {e}")
+            return self._extract_fallback(file_path)
+
+    def _process_sheet_openpyxl(
+        self, sheet, doc_name: str
+    ) -> Tuple[List[str], List[int]]:
+        """Обрабатывает один лист XLSX. Возвращает (тексты, количества)."""
+        sheet_texts = []
+        extracted_quantities = []
+        headers = []
+        quantity_col_idx = -1
+        service_col_idx = -1
+        is_nmck_file = self._is_nmck_file(doc_name)
+
+        for row_idx, row in enumerate(sheet.iter_rows()):
+            row_values = [
+                str(cell.value) if cell.value is not None else ""
+                for cell in row
+            ]
+            row_text = [v for v in row_values if v.strip()]
+
+            if not row_text:
+                continue
+
+            # Определяем заголовки (первая непустая строка)
+            if row_idx == 0 or (row_idx < 3 and not headers):
+                headers = [v.lower().strip() for v in row_values]
+                quantity_col_idx = self._find_quantity_column(headers)
+                service_col_idx = self._find_service_column(headers)
+                logger.debug(
+                    f"[ExcelExtractor] Заголовки: qty_col={quantity_col_idx}, "
+                    f"svc_col={service_col_idx}"
+                )
+                continue
+
+            # Формируем строку с подписями заголовков
+            enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
+            if enriched_row:
+                sheet_texts.append(" | ".join(enriched_row))
+
+            # Ищем количество
+            qty = self._extract_quantity_from_row(
+                row_values, headers, quantity_col_idx, service_col_idx, is_nmck_file
+            )
+            if qty is not None and qty not in extracted_quantities:
+                extracted_quantities.append(qty)
+
+        if sheet_texts:
+            sheet_texts.insert(0, f"=== ЛИСТ: {sheet.title} ===")
+
+        return sheet_texts, extracted_quantities
+
+    def _extract_structured_xlrd(self, file_path: Path, doc_name: str) -> str:
+        """Извлекает XLS со структурированными данными."""
+        try:
+            wb = xlrd.open_workbook(file_path)
+            all_texts = []
+            extracted_quantities = []
+
+            for sheet in wb.sheets():
+                sheet_texts, quantities = self._process_sheet_xlrd(sheet, doc_name)
+                all_texts.extend(sheet_texts)
+                extracted_quantities.extend(quantities)
+
+            if extracted_quantities:
+                prefix = "\n".join(
+                    f"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = {q} ==="
+                    for q in extracted_quantities[:5]
+                )
+                all_texts.insert(0, prefix)
+
+            result = "\n".join(all_texts)
+            logger.info(
+                f"[ExcelExtractor] XLS извлечён: {len(all_texts)} строк, "
+                f"количеств найдено: {len(extracted_quantities)}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[ExcelExtractor] Ошибка xlrd: {e}")
+            return self._extract_fallback(file_path)
+
+    def _process_sheet_xlrd(
+        self, sheet, doc_name: str
+    ) -> Tuple[List[str], List[int]]:
+        """Обрабатывает один лист XLS."""
+        sheet_texts = []
+        extracted_quantities = []
+        headers = []
+        quantity_col_idx = -1
+        service_col_idx = -1
+        is_nmck_file = self._is_nmck_file(doc_name)
+
+        for row_idx in range(sheet.nrows):
+            row_values = [
+                str(sheet.cell_value(row_idx, col_idx))
+                for col_idx in range(sheet.ncols)
+            ]
+            row_text = [v for v in row_values if v.strip()]
+
+            if not row_text:
+                continue
+
+            if row_idx == 0 or (row_idx < 3 and not headers):
+                headers = [v.lower().strip() for v in row_values]
+                quantity_col_idx = self._find_quantity_column(headers)
+                service_col_idx = self._find_service_column(headers)
+                continue
+
+            enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
+            if enriched_row:
+                sheet_texts.append(" | ".join(enriched_row))
+
+            qty = self._extract_quantity_from_row(
+                row_values, headers, quantity_col_idx, service_col_idx, is_nmck_file
+            )
+            if qty is not None and qty not in extracted_quantities:
+                extracted_quantities.append(qty)
+
+        if sheet_texts:
+            sheet_texts.insert(0, f"=== ЛИСТ: {sheet.name} ===")
+
+        return sheet_texts, extracted_quantities
+
+    def _find_quantity_column(self, headers: List[str]) -> int:
+        """Находит индекс колонки с количеством."""
+        for idx, h in enumerate(headers):
+            if any(kw in h for kw in QUANTITY_COLUMN_KEYWORDS):
+                logger.info(f"[ExcelExtractor] Колонка количества: '{h}' (idx {idx})")
+                return idx
+        return -1
+
+    def _find_service_column(self, headers: List[str]) -> int:
+        """Находит индекс колонки с наименованием услуги."""
+        for idx, h in enumerate(headers):
+            if any(kw in h for kw in ["наименование", "услуга", "работа", "предмет"]):
+                return idx
+        return -1
+
+    def _is_nmck_file(self, doc_name: str) -> bool:
+        """Проверяет, является ли файл «Обоснованием НМЦК»."""
+        name_lower = doc_name.lower()
+        return any(kw in name_lower for kw in NMCK_FILE_KEYWORDS)
+
+    def _enrich_row(
+        self, row_values: List[str], headers: List[str], quantity_col_idx: int
+    ) -> List[str]:
+        """Формирует строку с подписями заголовков."""
+        enriched = []
+        for col_idx, cell_value in enumerate(row_values):
+            if not cell_value.strip():
+                continue
+            if col_idx < len(headers) and headers[col_idx]:
+                header = headers[col_idx]
+                if col_idx == quantity_col_idx:
+                    enriched.append(f"{header}: {cell_value}")
+                else:
+                    enriched.append(cell_value)
+            else:
+                enriched.append(cell_value)
+        return enriched
+
+    def _extract_quantity_from_row(
+        self,
+        row_values: List[str],
+        headers: List[str],
+        quantity_col_idx: int,
+        service_col_idx: int,
+        is_nmck_file: bool,
+    ) -> Optional[int]:
+        """
+        Извлекает количество из строки.
+        Багфикс v6.6-r2: работает и без колонки услуги (для «Обоснования НМЦК»).
+        """
+        if quantity_col_idx < 0 or quantity_col_idx >= len(row_values):
+            return None
+
+        qty_cell = row_values[quantity_col_idx]
+        if not qty_cell or not qty_cell.strip():
+            return None
+
+        qty_str = str(qty_cell).replace(" ", "").replace(",", ".")
+
+        # Проверяем, что это не фантомное число
+        if self._is_phantom_number(qty_str):
+            return None
+
+        try:
+            qty = int(float(qty_str))
+        except (ValueError, TypeError):
+            return None
+
+        # Фильтр: отбрасываем явно нереалистичные значения
+        if qty <= 0 or qty > 10000:
+            return None
+
+        # Если есть колонка услуги — проверяем ключевые слова
+        if service_col_idx >= 0 and service_col_idx < len(row_values):
+            service_str = str(row_values[service_col_idx]).lower()
+            if any(kw in service_str for kw in SERVICE_ROW_KEYWORDS):
+                logger.info(
+                    f"[ExcelExtractor] Найдено qty={qty} (услуга: {service_str[:50]})"
+                )
+                return qty
+
+        # Для «Обоснования НМЦК» — не требуем колонку услуги
+        if is_nmck_file:
+            logger.info(
+                f"[ExcelExtractor] Найдено qty={qty} (Обоснование НМЦК)"
+            )
+            return qty
+
+        # Если нет колонки услуги и это не НМЦК — всё равно возвращаем
+        # (пусть analyzer решает, подходит ли)
+        if service_col_idx < 0:
+            logger.info(f"[ExcelExtractor] Найдено qty={qty} (без колонки услуги)")
+            return qty
+
+        return None
+
+    def _is_phantom_number(self, text: str) -> bool:
+        """Проверяет, является ли строка фантомным числом (телефон, ИНН и т.д.)."""
+        for pattern in self.PHANTOM_PATTERNS:
+            if pattern.match(text):
+                return True
+        return False
+
+    def _extract_fallback(self, file_path: Path) -> str:
+        """Fallback: обычное извлечение как plain text."""
+        try:
+            if HAS_OPENPYXL:
+                wb = openpyxl.load_workbook(file_path, data_only=True)
+                texts = []
+                for sheet in wb.worksheets:
+                    for row in sheet.iter_rows():
+                        row_text = [
+                            str(cell.value) for cell in row if cell.value is not None
+                        ]
+                        if row_text:
+                            texts.append(" | ".join(row_text))
+                return "\n".join(texts)
+            elif HAS_XLRD:
+                wb = xlrd.open_workbook(file_path)
+                texts = []
+                for sheet in wb.sheets():
+                    for row_idx in range(sheet.nrows):
+                        row_text = [
+                            str(sheet.cell_value(row_idx, col_idx))
+                            for col_idx in range(sheet.ncols)
+                        ]
+                        if row_text:
+                            texts.append(" | ".join(row_text))
+                return "\n".join(texts)
+            return ""
+        except Exception as e:
+            logger.error(f"[ExcelExtractor] Ошибка fallback: {e}")
+            return ""

@@ -131,16 +131,10 @@ class TenderURLBuilder:
         )
 
     def _build_223_documents(self, reg_number: str, notice_guid: str = "") -> str:
-        """URL документов для 223-ФЗ."""
         if notice_guid:
-            return (
-                f"{BASE_URL}/epz/order/notice/notice223/documents.html"
-                f"?purchaseNoticeNumber={reg_number}&noticeGuid={notice_guid}"
-            )
-        return (
-            f"{BASE_URL}/223/purchase/public/purchase/info/documents.html"
-            f"?regNumber={reg_number}"
-        )
+            return f"{BASE_URL}/epz/order/notice/notice223/documents.html?purchaseNoticeNumber={reg_number}&noticeGuid={notice_guid}"
+        # ← v6.4.2: fallback на рабочий URL без noticeGuid
+        return f"{BASE_URL}/epz/order/notice/notice223/documents.html?purchaseNoticeNumber={reg_number}"
 
     def detect_44_purchase_type(self, title: str = "", method: str = "") -> str:
         """

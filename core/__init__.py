@@ -1,0 +1,3 @@
+"""
+TENDER-BOT core package.
+"""

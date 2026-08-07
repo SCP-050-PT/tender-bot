@@ -1,11 +1,11 @@
 """
 core/tender_type.py
 Единое определение типа тендера.
-ИСПРАВЛЕНО (27.07.2026 v6.3):
-  - Консолидирована логика из text_extractor.py, analyzer.py, detailed_parser.py
-  - Приоритет: эксклюзивные ключевые слова обучения > СОУТ > ПЛК > ОПР
-  - combined: СОУТ + ОПР (НЕ education + СОУТ — это education)
-  - Валидация: education с rm_total>0 и students_count=0 → подозрительно
+ИСПРАВЛЕНО (29.07.2026 v6.5):
+  - detect_variant: контекстная проверка "протокол" в СОУТ vs обучение
+  - "протокол проверки знаний" → НЕ variant=3
+  - "протокол комиссии" → НЕ variant=3
+  - Только "протоколы СОУТ" или "комплекты протоколов СОУТ" → variant=3
 """
 
 import re
@@ -16,23 +16,18 @@ from loguru import logger
 
 @dataclass
 class TypeDetectionResult:
-    tender_type: str  # "соут", "обучение", "плк", "опр", "комбинированный"
-    confidence: float  # 0.0–1.0
+    tender_type: str
+    confidence: float
     is_combined: bool
-    primary_type: str  # Для combined — основной тип
-    secondary_type: str  # Для combined — вторичный тип
-    matched_keywords: list  # Какие ключевые слова сработали
-    reason: str  # Почему выбран этот тип
+    primary_type: str
+    secondary_type: str
+    matched_keywords: list
+    reason: str
 
 
 class TenderTypeDetector:
-    """
-    Единый детектор типа тендера.
-    Заменяет: _detect_type() в text_extractor.py, _normalize_tender_type() в analyzer.py,
-    TYPE_PATTERNS в detailed_parser.py, _extract_params_from_text() в analyzer.py.
-    """
+    """Единый детектор типа тендера."""
 
-    # === АЛИАСЫ ТИПОВ ===
     TYPE_ALIASES = {
         "sout": "соут",
         "education": "обучение",
@@ -55,8 +50,6 @@ class TenderTypeDetector:
         "opr_sout": "комбинированный",
     }
 
-    # === КЛЮЧЕВЫЕ СЛОВА С ВЕСАМИ ===
-    # Вес определяет "силу" сигнала. 10 = эксклюзивное (гарантированно этот тип)
     TYPE_KEYWORDS = {
         "соут": [
             ("специальная оценка условий труда", 10),
@@ -65,10 +58,9 @@ class TenderTypeDetector:
             ("оценка рабочих мест", 8),
             ("специальная оценка", 7),
             ("соут", 10),
-            ("сои", 8),  # Сводная оценка условий
+            ("сои", 8),
         ],
         "обучение": [
-            # ЭКСКЛЮЗИВНЫЕ — приоритет 100, не перехватываются СОУТ
             ("обучение охране труда", 100),
             ("обучение по охране труда", 100),
             ("обучению охране труда", 100),
@@ -77,7 +69,6 @@ class TenderTypeDetector:
             ("услуги по обучению", 100),
             ("обучение работников", 100),
             ("обучение работодателей", 100),
-            # Обычные
             ("обучение", 5),
             ("повышение квалификации", 8),
             ("переподготовка", 8),
@@ -90,7 +81,6 @@ class TenderTypeDetector:
             ("аттестация", 6),
             ("инструктаж", 5),
             ("тренинг", 5),
-            # Тематические (тоже обучение)
             ("пожарная безопасность", 6),
             ("промышленная безопасность", 6),
             ("электробезопасность", 6),
@@ -98,8 +88,8 @@ class TenderTypeDetector:
             ("газоопасные работы", 6),
             ("первая помощь", 6),
             ("технологические карты", 6),
-            ("озп", 6),  # Ограниченные пространства
-            ("ппр", 6),  # Проект производства работ
+            ("озп", 6),
+            ("ппр", 6),
             ("техносферная безопасность", 6),
         ],
         "плк": [
@@ -121,55 +111,61 @@ class TenderTypeDetector:
         ],
     }
 
-    # === ВАРИАНТЫ СОУТ ===
+    # ← v6.5: УЛУЧШЕННЫЕ ВАРИАНТЫ СОУТ С КОНТЕКСТНОЙ ПРОВЕРКОЙ
     VARIANT_KEYWORDS = {
-        2: ["карта", "карты", "карт", "индивидуальная карта", "оценочная карта"],
-        3: ["протокол", "протоколы", "комплект", "комплекты", "протоколов"],
+        2: {
+            "positive": [
+                "карта",
+                "карты",
+                "карт",
+                "индивидуальная карта",
+                "оценочная карта",
+            ],
+            "negative": [],  # Нет ложных срабатываний для карт
+        },
+        3: {
+            "positive": [
+                "протоколы соут",
+                "протоколы специальной оценки",
+                "комплекты протоколов соут",
+                "комплекты протоколов специальной оценки",
+                "протоколы условий труда",
+            ],
+            "negative": [
+                "протокол проверки знаний",
+                "протокол аттестации",
+                "протокол обучения",
+                "протокол комиссии",
+                "протокол идентификации",
+                "протокол заседания",
+                "протокол собрания",
+            ],
+        },
     }
 
     def __init__(self):
-        logger.info("TenderTypeDetector инициализирован (v6.3)")
+        logger.info("TenderTypeDetector инициализирован (v6.5)")
 
     def detect(
         self, text: str, llm_type_hint: Optional[str] = None
     ) -> TypeDetectionResult:
-        """
-        Определяет тип тендера по тексту.
-
-        Алгоритм:
-        1. Нормализуем LLM-hint если есть
-        2. Считаем взвешенные скоры по ключевым словам
-        3. Проверяем эксклюзивные паттерны (вес 100)
-        4. Определяем combined (только СОУТ + ОПР)
-        5. Возвращаем результат с confidence
-        """
         if not text:
             return self._result("соут", 0.0, [], "пустой текст")
 
         text_lower = text.lower()
 
-        # === Шаг 1: Нормализация LLM-hint ===
-        if llm_type_hint:
-            normalized_hint = self._normalize_alias(llm_type_hint)
-            # Если LLM дал конкретный тип с высоким confidence — доверяем
-            # Но проверим на противоречия
-            pass  # Используем как дополнительный сигнал ниже
-
-        # === Шаг 2: Подсчёт взвешенных скоров ===
         scores = {}
         matched_keywords = []
 
         for ttype, keywords in self.TYPE_KEYWORDS.items():
             score = 0
             for keyword, weight in keywords:
-                # Ищем как подстроку (регистронезависимо)
                 count = text_lower.count(keyword.lower())
                 if count > 0:
                     score += count * weight
                     matched_keywords.append((ttype, keyword, weight, count))
             scores[ttype] = score
 
-        # === Шаг 3: Проверка эксклюзивных паттернов (вес 100) ===
         exclusive_education = False
         for ttype, keywords in self.TYPE_KEYWORDS.items():
             for keyword, weight in keywords:
@@ -181,16 +177,13 @@ class TenderTypeDetector:
                         )
                         break
 
-        # === Шаг 4: Определение combined ===
         has_sout = scores.get("соут", 0) > 0
         has_opr = scores.get("опр", 0) > 0
         has_education = scores.get("обучение", 0) > 0
         has_plk = scores.get("плк", 0) > 0
 
-        # combined ТОЛЬКО если СОУТ + ОПР (и нет эксклюзивного обучения)
         is_combined = has_sout and has_opr and not exclusive_education
 
-        # Если есть эксклюзивное обучение — это обучение, даже если есть СОУТ
         if exclusive_education:
             final_type = "обучение"
             confidence = min(1.0, 0.5 + scores.get("обучение", 0) / 100)
@@ -206,26 +199,22 @@ class TenderTypeDetector:
             )
 
         else:
-            # Выбираем тип с максимальным скором
             if not scores or max(scores.values()) == 0:
-                final_type = "соут"  # fallback
+                final_type = "соут"
                 confidence = 0.1
                 reason = "нет ключевых слов → fallback 'соут'"
             else:
-                # Исключаем combined из выбора
                 candidate_scores = {
                     k: v for k, v in scores.items() if k != "комбинированный"
                 }
                 best_type = max(candidate_scores, key=candidate_scores.get)
                 best_score = candidate_scores[best_type]
 
-                # Проверяем, не равны ли скоры обучения и СОУТ
                 if (
                     has_education
                     and has_sout
                     and scores.get("обучение", 0) == scores.get("соут", 0)
                 ):
-                    # При равенстве — приоритет обучению (если есть слово "обучение" в тексте)
                     if "обучение" in text_lower:
                         final_type = "обучение"
                         reason = "равные скоры, приоритет 'обучение' (по правилу)"
@@ -236,16 +225,12 @@ class TenderTypeDetector:
                     final_type = best_type
                     reason = f"максимальный скор: {best_type}={best_score}"
 
-                # Расчёт confidence
                 total_score = sum(candidate_scores.values())
                 if total_score > 0:
-                    confidence = min(1.0, best_score / total_score * 2)  # Нормализация
+                    confidence = min(1.0, best_score / total_score * 2)
                 else:
                     confidence = 0.3
 
-        # === Шаг 5: Дополнительная валидация ===
-        # Если тип "обучение", но есть rm_total и нет students_count — подозрительно
-        # Эта проверка делается в analyzer, но логируем здесь
         if (
             final_type == "обучение"
             and "рабочих мест" in text_lower
@@ -255,19 +240,17 @@ class TenderTypeDetector:
                 f"[tender_type] Тип 'обучение', но найдено 'рабочих мест' без 'слушателей' — "
                 f"возможно неверное определение"
             )
-            confidence *= 0.7  # Понижаем confidence
+            confidence *= 0.7
 
-        # === Шаг 6: Учёт LLM-hint ===
         if llm_type_hint:
             normalized_hint = self._normalize_alias(llm_type_hint)
             if normalized_hint != final_type and confidence < 0.5:
-                # Низкий confidence + расхождение с LLM — используем LLM
                 logger.info(
                     f"[tender_type] Низкий confidence={confidence:.2f}, "
                     f"LLM говорит '{normalized_hint}' → используем LLM"
                 )
                 final_type = normalized_hint
-                confidence = 0.5  # Средний confidence при использовании LLM
+                confidence = 0.5
                 reason += f" (скорректировано по LLM: {normalized_hint})"
 
         return TypeDetectionResult(
@@ -283,40 +266,73 @@ class TenderTypeDetector:
         )
 
     def detect_variant(self, text: str, llm_variant: Optional[int] = None) -> int:
-        """Определяет вариант СОУТ (1, 2, 3)."""
+        """
+        Определяет вариант СОУТ (1, 2, 3) с контекстной проверкой.
+        """
         if llm_variant in (1, 2, 3):
             logger.info(f"Вариант СОУТ из LLM: {llm_variant}")
             return llm_variant
 
         text_lower = text.lower()
 
-        # Проверяем вариант 3 (протоколы)
-        for kw in self.VARIANT_KEYWORDS[3]:
+        # ← v6.5: Проверяем вариант 3 с контекстной фильтрацией
+        variant3_positive = self.VARIANT_KEYWORDS[3]["positive"]
+        variant3_negative = self.VARIANT_KEYWORDS[3]["negative"]
+
+        for kw in variant3_positive:
             if kw in text_lower:
-                logger.info(f"Вариант СОУТ 3 (по keywords '{kw}'): протоколы/комплекты")
-                return 3
+                # Дополнительная проверка: не попадает ли в negative?
+                is_false_positive = False
+                for neg_kw in variant3_negative:
+                    if neg_kw in text_lower:
+                        # Проверяем: positive находится рядом с "соут" или "специальная оценка"?
+                        # Если нет — возможно false positive
+                        context_window = text_lower[
+                            max(0, text_lower.find(kw) - 100) : text_lower.find(kw)
+                            + 100
+                        ]
+                        if (
+                            "соут" not in context_window
+                            and "специальная оценка" not in context_window
+                        ):
+                            is_false_positive = True
+                            logger.info(
+                                f"[v6.5] Пропущен false positive: '{kw}' найдено, но рядом '{neg_kw}' без контекста СОУТ"
+                            )
+                            break
+
+                if not is_false_positive:
+                    logger.info(
+                        f"[v6.5] Вариант СОУТ 3 (по keywords '{kw}'): протоколы/комплекты СОУТ"
+                    )
+                    return 3
+
+        # ← v6.5: Проверяем, не попало ли слово "протокол" в negative-список
+        for neg_kw in variant3_negative:
+            if neg_kw in text_lower:
+                logger.info(
+                    f"[v6.5] Слово 'протокол' в контексте '{neg_kw}' — это НЕ variant=3 (обучение/комиссия)"
+                )
 
         # Проверяем вариант 2 (карты)
-        for kw in self.VARIANT_KEYWORDS[2]:
+        for kw in self.VARIANT_KEYWORDS[2]["positive"]:
             if kw in text_lower:
-                logger.info(f"Вариант СОУТ 2 (по keywords '{kw}'): карты")
+                logger.info(f"[v6.5] Вариант СОУТ 2 (по keywords '{kw}'): карты")
                 return 2
 
-        logger.info("Вариант СОУТ 1 (по умолчанию): 20% основных + аналогия")
+        logger.info("[v6.5] Вариант СОУТ 1 (по умолчанию): 20% основных + аналогия")
         return 1
 
     def _normalize_alias(self, raw_type: str) -> str:
-        """Нормализует строковый тип в стандартное название."""
         if not raw_type:
             return "соут"
         raw_lower = raw_type.lower().strip()
         if raw_lower in self.TYPE_ALIASES:
             return self.TYPE_ALIASES[raw_lower]
-        # Поиск по частичному совпадению
         for alias, normalized in self.TYPE_ALIASES.items():
             if alias in raw_lower or raw_lower in alias:
                 return normalized
-        return "соут"  # fallback
+        return "соут"
 
     def _result(
         self, ttype: str, confidence: float, matched: list, reason: str
@@ -334,10 +350,6 @@ class TenderTypeDetector:
     def validate_education_has_students(
         self, text: str, students_count: int
     ) -> Tuple[bool, str]:
-        """
-        Проверяет, что тендер типа "обучение" имеет слушателей.
-        Возвращает (is_valid, warning_message).
-        """
         if students_count > 0:
             return True, ""
 
@@ -353,9 +365,6 @@ class TenderTypeDetector:
         return True, ""
 
     def validate_sout_has_rm(self, text: str, rm_total: int) -> Tuple[bool, str]:
-        """
-        Проверяет, что тендер типа "соут" имеет рабочие места.
-        """
         if rm_total > 0:
             return True, ""
 
@@ -369,3 +378,13 @@ class TenderTypeDetector:
             return False, "Тип 'соут', но количество РМ не найдено в тексте"
 
         return True, ""
+
+
+_type_detector: Optional[TenderTypeDetector] = None
+
+
+def get_type_detector() -> TenderTypeDetector:
+    global _type_detector
+    if _type_detector is None:
+        _type_detector = TenderTypeDetector()
+    return _type_detector

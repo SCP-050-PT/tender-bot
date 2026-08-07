@@ -1,0 +1,167 @@
+"""
+Экстрактор текста из ZIP-архивов.
+Распаковывает и рекурсивно обрабатывает вложенные файлы.
+"""
+
+import re
+import zipfile
+import tempfile
+import shutil
+from pathlib import Path
+from typing import List
+from loguru import logger
+
+from core.config.document_config import FILE_PRIORITY, CONTRACT_PATTERNS
+from core.extractors.base_extractor import BaseExtractor
+
+
+class ZipExtractor(BaseExtractor):
+    """Извлекает текст из ZIP-архивов, обрабатывая вложенные файлы."""
+
+    SUPPORTED_EXTENSIONS = ["zip"]
+
+    def __init__(self, max_files: int = 3):
+        super().__init__()
+        self.max_files = max_files
+        # Инициализируем суб-экстракторы для вложенных файлов
+        self._sub_extractors = {}
+
+    def _get_sub_extractor(self, ext: str):
+        """Ленивая инициализация суб-экстракторов."""
+        if ext not in self._sub_extractors:
+            if ext in ["docx", "doc"]:
+                from core.extractors.docx_extractor import DocxExtractor
+                self._sub_extractors[ext] = DocxExtractor()
+            elif ext == "pdf":
+                from core.extractors.pdf_extractor import PdfExtractor
+                self._sub_extractors[ext] = PdfExtractor()
+            elif ext in ["xlsx", "xls"]:
+                from core.extractors.excel_extractor import ExcelExtractor
+                self._sub_extractors[ext] = ExcelExtractor()
+            elif ext == "zip":
+                self._sub_extractors[ext] = ZipExtractor(max_files=self.max_files)
+            elif ext in ["txt", "rtf"]:
+                from core.extractors.text_extractor import TextExtractor
+                self._sub_extractors[ext] = TextExtractor()
+        return self._sub_extractors.get(ext)
+
+    def extract(self, file_path: Path, doc_name: str = "") -> str:
+        temp_dir = Path(tempfile.mkdtemp(prefix="tender_zip_"))
+        texts = []
+
+        try:
+            with zipfile.ZipFile(file_path, "r") as z:
+                files = self._list_files(z)
+                prioritized = self._prioritize_files(files)
+
+                for priority, fname, ext, _ in prioritized[: self.max_files]:
+                    try:
+                        text = self._extract_file(z, fname, ext, temp_dir)
+                        if text:
+                            texts.append(f"=== ВЛОЖЕННЫЙ ФАЙЛ: {fname} ===\n{text}")
+                    except Exception as e:
+                        logger.warning(f"[ZipExtractor] Ошибка {fname}: {e}")
+                        continue
+
+        except zipfile.BadZipFile:
+            logger.error(f"[ZipExtractor] Повреждённый ZIP: {doc_name}")
+            return ""
+        except Exception as e:
+            logger.error(f"[ZipExtractor] Ошибка {doc_name}: {e}")
+            return ""
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        result = "\n\n".join(texts)
+        logger.info(f"[ZipExtractor] Извлечено: {len(result)} символов")
+        return result
+
+    def _list_files(self, z: zipfile.ZipFile) -> List[str]:
+        """Возвращает список файлов, исключая служебные."""
+        return [
+            f
+            for f in z.namelist()
+            if not f.startswith("__MACOSX/") and not f.startswith(".") and not f.endswith("/")
+        ]
+
+    def _prioritize_files(self, files: List[str]) -> List[tuple]:
+        """Сортирует файлы по приоритету."""
+        prioritized = []
+        for fname in files:
+            priority = self._get_file_priority(fname)
+            is_contract = self._is_contract_file(fname)
+            ext = Path(fname).suffix.lower().lstrip(".")
+            if is_contract:
+                continue
+            prioritized.append((priority, fname, ext, is_contract))
+        prioritized.sort(key=lambda x: (-x[0], x[3]))
+        return prioritized
+
+    def _get_file_priority(self, filename: str) -> int:
+        if not filename:
+            return 0
+        name_lower = filename.lower()
+        max_priority = 0
+        for pattern, priority in FILE_PRIORITY.items():
+            if re.search(pattern, name_lower, re.IGNORECASE):
+                max_priority = max(max_priority, priority)
+        return max_priority
+
+    def _is_contract_file(self, filename: str) -> bool:
+        if not filename:
+            return False
+        name_lower = filename.lower()
+        for pattern in CONTRACT_PATTERNS:
+            if re.search(pattern, name_lower, re.IGNORECASE):
+                return True
+        return False
+
+    def _extract_file(
+        self, z: zipfile.ZipFile, fname: str, ext: str, temp_dir: Path
+    ) -> str:
+        """Извлекает один файл из ZIP и обрабатывает его."""
+        # Декодируем имя файла
+        try:
+            decoded_fname = fname.encode("cp437").decode("utf-8")
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            try:
+                decoded_fname = fname.encode("cp437").decode("cp866")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                decoded_fname = fname
+
+        safe_fname = re.sub(r"[^\w\-_.]", "_", decoded_fname)[:100]
+        extracted_path = temp_dir / safe_fname
+
+        with z.open(fname) as src, open(extracted_path, "wb") as dst:
+            dst.write(src.read())
+
+        # Определяем реальный тип по содержимому
+        real_ext = ext
+        if ext not in ["docx", "doc", "pdf", "xlsx", "xls", "txt", "rtf", "zip"]:
+            real_ext = self._detect_by_content(extracted_path) or ext
+
+        extractor = self._get_sub_extractor(real_ext)
+        if extractor:
+            text = extractor.extract(extracted_path, decoded_fname)
+            logger.info(f"[ZipExtractor] {decoded_fname}: {len(text)} симв.")
+            return text
+        else:
+            # Пробуем определить по содержимому
+            from core.extractors.text_extractor import TextExtractor
+            return TextExtractor().extract(extracted_path, decoded_fname)
+
+    def _detect_by_content(self, file_path: Path) -> str:
+        """Определяет тип файла по магическим байтам."""
+        try:
+            with open(file_path, "rb") as f:
+                header = f.read(8)
+            from core.config.document_config import PDF_MAGIC, ZIP_MAGIC, OLE2_MAGIC
+            if header.startswith(PDF_MAGIC):
+                return "pdf"
+            elif header.startswith(ZIP_MAGIC):
+                return "zip"
+            elif header.startswith(OLE2_MAGIC):
+                return "doc"
+        except Exception:
+            pass
+        return ""
