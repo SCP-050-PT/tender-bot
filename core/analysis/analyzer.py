@@ -14,7 +14,7 @@ from core.param_extractor import TenderParamExtractor
 from core.tender_type import get_type_detector
 from core.analysis.llm_wrapper import LlmWrapper
 from core.analysis.result_formatter import TenderAnalysis
-
+from core.calculation.calculator import TenderCalculator, CalculationResult
 
 class TenderAnalyzer:
     """Главный анализатор тендера. Оркестрирует извлечение, расчёт и валидацию."""
@@ -52,10 +52,12 @@ class TenderAnalyzer:
         )
 
         # --- Шаг 2: Двухуровневый LLM-анализ ---
-        llm_result = self._call_llm(tender_text, tender_info, extracted)
+        llm_result, classification = self._call_llm(tender_text, tender_info, extracted)
         if not isinstance(llm_result, dict):
             llm_result = None
-        llm_confidence = llm_result.get("confidence", 0.0) if llm_result else 0.0
+            llm_confidence = 0.0
+        else:
+            llm_confidence = llm_result.get("confidence", 0.0)
 
         # --- Шаг 3: Валидация LLM-результатов ---
         llm_needs_review = False
@@ -76,7 +78,7 @@ class TenderAnalyzer:
                 llm_result = merged.to_dict() if hasattr(merged, "to_dict") else merged
 
             tender_type = self._resolve_tender_type(
-                llm_result, llm_confidence, extracted_type_hint
+                llm_result, llm_confidence, extracted_type_hint, classification
             )
             details = self._normalize_llm_params(llm_result)
             quantity_source = self._detect_quantity_source(llm_result)
@@ -221,11 +223,9 @@ class TenderAnalyzer:
             return None
 
     def _call_llm(self, tender_text: str, tender_info: dict, extracted):
-        """Двухуровневый LLM-анализ: классификация → извлечение параметров."""
         if not self.llm_wrapper.llm or self.llm_wrapper.llm is False:
-            return None
+            return None, None
 
-        # Этап 1: Классификация
         classification = self._classify_tender(tender_text, tender_info, extracted)
         if classification:
             logger.info(
@@ -233,7 +233,6 @@ class TenderAnalyzer:
                 f"confidence={classification.get('confidence', 0)}"
             )
 
-        # Этап 2: Извлечение параметров
         try:
             result = self.llm_wrapper.analyze_tender(
                 tender_text=tender_text,
@@ -243,10 +242,11 @@ class TenderAnalyzer:
             )
             if result:
                 logger.info(f"LLM confidence: {result.get('confidence', 0.0):.2f}")
-            return result
+                return result, classification  # ← tuple
         except Exception as e:
             logger.warning(f"LLM-анализ не удался: {e}")
-            return None
+
+        return None, classification  # ← classification сохраняется
 
     def _classify_tender(
         self, tender_text: str, tender_info: dict, extracted
@@ -286,35 +286,37 @@ class TenderAnalyzer:
         return None
 
     def _resolve_tender_type(
-        self, llm_result: dict, llm_confidence: float, extracted_type_hint: str
+        self, llm_result: dict, llm_confidence: float, extracted_type_hint: str,
+        classification: dict = None  # ← новый параметр
     ) -> str:
-        """Определяет финальный тип тендера."""
-        # v6.7.1: Учитываем combined — students_count не форсирует обучение если есть opr_positions
         students = llm_result.get("students_count", 0) if llm_result else 0
         opr_positions = llm_result.get("opr_positions", 0) if llm_result else 0
 
-        # Приоритет 1: students_count > 0 И НЕТ opr_positions → обучение
         if students > 0 and opr_positions == 0:
-            logger.info(f"[v6.7.1] students_count={students} > 0, нет ОПР → 'обучение'")
             return "обучение"
-
-        # Приоритет 1b: students_count > 0 И ЕСТЬ opr_positions → combined
         if students > 0 and opr_positions > 0:
-            logger.info(
-                f"[v6.7.1] students_count={students} + opr_positions={opr_positions} → 'комбинированный'"
-            )
             return "комбинированный"
 
-        # Приоритет 2: LLM с высоким confidence
+        # ← НОВОЕ: Если извлечение упало, но классификация была — используем её
+        if llm_confidence == 0 and classification:
+            classified_type = classification.get("tender_type", "").lower().strip()
+            if classified_type and classified_type != "unknown":
+                logger.info(
+                    f"[v6.7.2] Извлечение упало, используем классификацию: {classified_type}"
+                )
+                return classified_type
+
         llm_type = llm_result.get("tender_type", "соут") if llm_result else "соут"
+        # ← НОВОЕ: Если классификация сказала ОПР, а LLM сказал СОУТ — доверяем классификации
+        if classification and llm_confidence >= 0.7:
+            classified_type = classification.get("tender_type", "").lower().strip()
+            if classified_type == "opr" and llm_type in ("соут", "sout"):
+                logger.info(f"[v6.7.2] Классификация=opr, но LLM=соут → используем opr")
+                return "opr"
         if llm_confidence >= 0.3:
             return llm_type
 
-        # Приоритет 3: extracted_type_hint
         if extracted_type_hint:
-            logger.info(
-                f"[v6.7.1] Низкий confidence={llm_confidence:.2f}, используем тип из extracted: {extracted_type_hint}"
-            )
             return extracted_type_hint
 
         return llm_type
@@ -332,13 +334,15 @@ class TenderAnalyzer:
         return "llm"
 
     def _fallback_params(self, tender_text: str) -> dict:
-        """Fallback при отсутствии LLM."""
         new_params = self.param_extractor.extract(tender_text)
-        return {
-            **new_params.to_dict(),
+        result = new_params.to_dict()
+        if result.get("deadline_days") is None:
+            result["deadline_days"] = 30
+        result.update({
             "tender_type": self.type_detector.detect(tender_text).tender_type,
             "variant": self.type_detector.detect_variant(tender_text),
-        }
+        })
+        return result
 
     def _merge_tender_info(self, details: dict, tender_info: dict) -> dict:
         tender_type = (details.get("tender_type", "") or "").lower()
@@ -346,12 +350,16 @@ class TenderAnalyzer:
         # v6.7.1: ВСЕГДА определяем int_fields ДО if/else
         int_fields = []
         if "опр" in tender_type:
-            int_fields = ["opr_positions", "opr_persons"]
+            int_fields = ["opr_positions", "opr_persons", "rm_total"]  # ← +rm_total
             if tender_info.get("opr_positions"):
                 details["opr_positions"] = tender_info["opr_positions"]
             if tender_info.get("opr_persons"):
                 details["opr_persons"] = tender_info["opr_persons"]
-            logger.info("[v6.7.1] Тип=ОПР, rm_total из КТРУ игнорируется")
+            # ← НОВОЕ: КТРУ rm_total используем как fallback для opr_positions
+            if tender_info.get("rm_total") and details.get("opr_positions", 0) == 0:
+                details["opr_positions"] = tender_info["rm_total"]
+                logger.info(f"[v6.7.2] ОПР: opr_positions не найдено, используем КТРУ rm_total={tender_info['rm_total']}")
+            logger.info("[v6.7.1] Тип=ОПР, rm_total из КТРУ используется как fallback")
         else:
             int_fields = [
                 "students_count",
@@ -642,11 +650,40 @@ class TenderAnalyzer:
         elif "опр" in tt:
             opr_positions = details.get("opr_positions", 0) or 0
             opr_persons = details.get("opr_persons", 0) or 0
-            if opr_positions == 0 and details.get("rm_total", 0) > 0:
-                opr_positions = details["rm_total"]
-                logger.info(
-                    f"[v6.7.1] ОПР: используем rm_total={opr_positions} как opr_positions"
+            
+            # v6.7.2: Прямая проверка tender_info на случай, если _merge_tender_info не сработал
+            if opr_positions == 0:
+                # Проверяем tender_info напрямую
+                ti_rm = tender_info.get("rm_total", 0) if tender_info else 0
+                if ti_rm > 0:
+                    opr_positions = ti_rm
+                    logger.info(f"[v6.7.2] ОПР: используем tender_info rm_total={ti_rm}")
+                elif details.get("rm_total", 0) > 0:
+                    opr_positions = details["rm_total"]
+                    logger.info(f"[v6.7.2] ОПР: используем details rm_total={opr_positions}")
+            
+            # v6.7.2: Если opr_positions всё ещё 0 — используем rm_total (КТРУ или regex)
+            if opr_positions == 0:
+                rm_total = details.get("rm_total", 0) or 0
+                if rm_total > 0:
+                    opr_positions = rm_total
+                    logger.info(f"[v6.7.2] ОПР: opr_positions=0, используем rm_total={rm_total}")
+            
+            # v6.7.2: Если всё ещё 0 — ручная проверка
+            if opr_positions == 0:
+                logger.warning("[v6.7.2] ОПР: количество не определено, needs_manual_review=True")
+                return CalculationResult(
+                    cost_price=0,
+                    recommended_price=0,
+                    margin_percent=0,
+                    margin_rub=0,
+                    transport_cost=0,
+                    subcontractor_cost=0,
+                    details={"note": "ОПР: количество должностей не определено"},
+                    needs_manual_review=True,
+                    review_reason="ОПР: количество должностей/человек не определено из текста",
                 )
+            
             return self.calc.calculate_opr(
                 rm_count=opr_positions,
                 delivery_count=details.get("delivery_count", 1),
@@ -769,7 +806,7 @@ class TenderAnalyzer:
             margin_percent=margin_percent,
             cost_price=cost_price,
             nmck=nmck or 100000,
-            deadline_days=details.get("deadline_days", 30),
+            deadline_days=details.get("deadline_days") or 30,
             volume_large=quantity > 50 if quantity else False,
             region_distance=0,
             venue_required=details.get("has_venue", False),

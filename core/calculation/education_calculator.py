@@ -200,7 +200,23 @@ class EducationCalculator:
                 f"certs={actual_certificates}, diplomas={diplomas}, "
                 f"worker={worker_certs}, qual={qual_certs}, protocols={protocols_count}"
             )
-
+        # v6.7.2: ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА: ОТ → всегда протоколы
+        text_lower = tender_text.lower()
+        if "охрана труда" in text_lower or "обучение охране труда" in text_lower:
+            if protocols_count == 0 and (
+                qual_certs > 0 or diplomas > 0 or actual_certificates > 0
+            ):
+                forced_count = qual_certs or diplomas or actual_certificates
+                logger.warning(
+                    f"[v6.7.2] ПРИНУДИТЕЛЬНО: ОТ → protocols={forced_count}, "
+                    f"qual_certs=0, diplomas=0, certs=0"
+                )
+                protocols_count = forced_count
+                qual_certs = 0
+                diplomas = 0
+                actual_certificates = 0
+                # Пересчитаем total_explicit_docs
+                total_explicit_docs = protocols_count
         # === Логирование входных параметров ===
         logger.info(
             f"[EducationCalc] ВХОД: students={students_count}, certs={actual_certificates}, "

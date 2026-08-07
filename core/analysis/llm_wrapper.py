@@ -123,7 +123,7 @@ class LlmWrapper:
                 extracted_type = parsed.get("tender_type", "").lower().strip()
 
                 # Если классификация = opr, а извлечение = sout — принудительно opr
-                if classified_type == "opr" and extracted_type == "sout":
+                if classified_type == "opr" and extracted_type in ("sout", "соут"):
                     logger.warning(
                         f"[v6.7.1] Исправление типа: извлечение={extracted_type} → классификация={classified_type}"
                     )
@@ -146,6 +146,19 @@ class LlmWrapper:
 
             return parsed
         except Exception as e:
+            # v6.7.2: Если извлечение упало, но классификация была
+            if parsed is None and classification:
+                classified_type = classification.get("tender_type", "")
+                if classified_type:
+                    logger.warning(
+                        f"[v6.7.2] Извлечение упало, возвращаем fallback с типом {classified_type}"
+                    )
+                    return {
+                        "tender_type": classified_type,
+                        "confidence": 0.0,
+                        "parse_error": True,
+                        "notes": "JSON не распарсился, тип из классификации",
+                    }
             logger.error(f"Ошибка LLM-анализа: {e}")
             return None
 
@@ -292,6 +305,14 @@ class LlmWrapper:
         lines = [
             "=== НАЙДЕНО В ТЕКСТЕ (проверь и подтверди) ===",
         ]
+        if classification:
+            classified_type = classification.get("tender_type", "").lower()
+            lines.append(f"=== КЛАССИФИКАЦИЯ: {classified_type} ===")
+            if classified_type == "education":
+                lines.append("⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count")
+            elif classified_type == "opr":
+                lines.append("⚠️ КРИТИЧЕСКО: Это ОПР, НЕ СОУТ. rm_total = 0.")
+            lines.append("")
 
         fields = [
             ("Рабочих мест (РМ)", getattr(extracted_params, "rm_total", None)),
@@ -328,6 +349,12 @@ class LlmWrapper:
                     "Если извлечение параметров даёт другой тип — проверь внимательно.",
                 ]
             )
+
+        classified_type = classification.get("tender_type", "").lower()
+        if classified_type == "education":
+            lines.append("⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count")
+        elif classified_type == "opr":
+            lines.append("⚠️ КРИТИЧЕСКО: Это ОПР, НЕ СОУТ. rm_total = 0.")
 
         lines.extend(
             [
