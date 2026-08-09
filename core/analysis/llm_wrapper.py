@@ -1,7 +1,7 @@
 """
 core/analysis/llm_wrapper.py
-Обёртка для LLM-вызовов: JSON-промпт, отправка, парсинг, валидация.
-v6.7.1: JSON-only, classification передаётся в user_message, улучшенное сжатие.
+Обёртка для LLM-вызовов.
+v6.7.4: Исправлены баги с None, убрано сжатие.
 """
 
 import json
@@ -27,26 +27,18 @@ def get_system_prompt() -> str:
 
 
 def _get_fallback_system_prompt() -> str:
-    """Fallback промпт если system_prompt.txt недоступен."""
+    """Fallback промпт."""
     return """Ты — старший аналитик тендерного отдела компании «АС Безопасности».
 Проанализируй текст закупки и верни СТРОГИЙ JSON с параметрами.
-
 ТИПЫ: sout (СОУТ), education (обучение), plk (ПЛК), opr (ОПР), combined (СОУТ+ОПР).
-
-ВАРИАНТЫ СОУТ: 
-- variant=1 (по умолчанию): 20% + аналогия 100₽
-- variant=2: "карты условий труда" в тексте
-- variant=3: "протоколы СОУТ" или "комплекты протоколов СОУТ" (НЕ "протокол проверки знаний"!)
-
+ВАРИАНТЫ СОУТ: variant=1 (по умолчанию), variant=2 (карты), variant=3 (протоколы).
 ВАЖНО: "протокол проверки знаний" = обучение, НЕ variant=3.
-
 ДОКУМЕНТЫ ОБУЧЕНИЯ:
-- protocols_count: "обучение охране труда", "ОТ", "охрана труда" (ВСЕГДА протоколы для ОТ!)
-- certificates: "работа на высоте", "ограниченные пространства"
+- protocols_count: "обучение охране труда", "ОТ" (ВСЕГДА протоколы для ОТ!)
+- certificates: "работа на высоте"
 - diplomas: "переподготовка" (только если НЕ ОТ)
 - worker_certs: "рабочая профессия"
 - qual_certs: "повышение квалификации"
-
 Верни СТРОГИЙ JSON без markdown:
 {
   "tender_type": "sout|education|plk|opr|combined",
@@ -84,24 +76,21 @@ class LlmWrapper:
     ) -> Optional[dict]:
         """
         Двухуровневый анализ: классификация → извлечение параметров.
-        v6.7.1: classification передаётся в user_message этапа 2.
+        Возвращает dict или None.
         """
         if not self.llm or self.llm is False:
             return None
 
         system_prompt = get_system_prompt()
-        compressed_text = self._compress_text(tender_text, classification)
         context = self._build_context(tender_info, classification)
 
-        # v6.7.1: Передаём classification в user_message
+        # Строим user_message
         if extracted_params:
             user_message = self._build_enriched_user_message(
-                extracted_params, compressed_text, tender_info, classification
+                extracted_params, tender_text, tender_info, classification
             )
         else:
-            user_message = self._build_basic_user_message(
-                compressed_text, classification
-            )
+            user_message = self._build_basic_user_message(tender_text, classification)
 
         system_prompt_enriched = system_prompt + context
 
@@ -114,52 +103,46 @@ class LlmWrapper:
             )
             parsed = self._parse_llm_response(result)
             if parsed is None:
-                logger.warning("[LLM] Пустой/невалидный ответ, используем fallback")
+                logger.warning("[LLM] Пустой/невалидный ответ")
                 return None
 
-            # v6.7.1: Принудительно применяем classification если извлечение другое
+            # Принудительно применяем classification если извлечение другое
             if classification:
-                classified_type = classification.get("tender_type", "").lower().strip()
-                extracted_type = parsed.get("tender_type", "").lower().strip()
+                classified_type = (
+                    (classification.get("tender_type") or "").lower().strip()
+                )
+                extracted_type = (parsed.get("tender_type") or "").lower().strip()
 
-                # Если классификация = opr, а извлечение = sout — принудительно opr
                 if classified_type == "opr" and extracted_type in ("sout", "соут"):
-                    logger.warning(
-                        f"[v6.7.1] Исправление типа: извлечение={extracted_type} → классификация={classified_type}"
-                    )
+                    logger.warning(f"[v6.7.4] Исправление типа: {extracted_type} → opr")
                     parsed["tender_type"] = "opr"
                     parsed["notes"] = (
-                        parsed.get("notes", "")
-                        + " [Тип скорректирован по классификации: ОПР]"
+                        parsed.get("notes", "") + " [Тип скорректирован: ОПР]"
                     )
-
-                # Если классификация = education, а извлечение = sout — принудительно education
                 elif classified_type == "education" and extracted_type == "sout":
                     logger.warning(
-                        f"[v6.7.1] Исправление типа: извлечение={extracted_type} → классификация={classified_type}"
+                        f"[v6.7.4] Исправление типа: {extracted_type} → education"
                     )
                     parsed["tender_type"] = "education"
                     parsed["notes"] = (
-                        parsed.get("notes", "")
-                        + " [Тип скорректирован по классификации: обучение]"
+                        parsed.get("notes", "") + " [Тип скорректирован: обучение]"
                     )
 
             return parsed
+
         except Exception as e:
-            # v6.7.2: Если извлечение упало, но классификация была
-            if parsed is None and classification:
+            # v6.7.4: Исправлен баг — parsed может быть не определена
+            logger.error(f"Ошибка LLM-анализа: {e}")
+            if classification:
                 classified_type = classification.get("tender_type", "")
                 if classified_type:
-                    logger.warning(
-                        f"[v6.7.2] Извлечение упало, возвращаем fallback с типом {classified_type}"
-                    )
+                    logger.warning(f"[v6.7.4] Fallback с типом {classified_type}")
                     return {
                         "tender_type": classified_type,
                         "confidence": 0.0,
                         "parse_error": True,
-                        "notes": "JSON не распарсился, тип из классификации",
+                        "notes": "Ошибка анализа, тип из классификации",
                     }
-            logger.error(f"Ошибка LLM-анализа: {e}")
             return None
 
     def _build_context(self, tender_info: dict, classification: Optional[dict]) -> str:
@@ -184,57 +167,30 @@ class LlmWrapper:
         )
         return "\n".join(lines)
 
-    def _compress_text(self, text: str, classification=None) -> str:
-        """v6.7.3: Сжатие отключено (эффективность 4%, не стоит сложности)."""
-        return text
-
-    def _compress_repeats(self, lines: List[str]) -> List[str]:
-        """Сжимает повторяющиеся строки."""
-        if not lines:
-            return []
-
-        result = []
-        prev = None
-        repeat_count = 0
-
-        for line in lines:
-            if line == prev:
-                repeat_count += 1
-                continue
-            if repeat_count > 2:
-                result.append(f"[... повторяется {repeat_count} раз ...]")
-            if prev is not None:
-                result.append(prev)
-            prev = line
-            repeat_count = 0
-
-        if prev:
-            if repeat_count > 2:
-                result.append(f"[... повторяется {repeat_count} раз ...]")
-            result.append(prev)
-
-        return result
-
     def _build_enriched_user_message(
         self,
         extracted_params,
-        compressed_text: str,
+        tender_text: str,
         tender_info: dict,
         classification: Optional[dict] = None,
     ) -> str:
         """Строит обогащённый промпт с найденными параметрами."""
-        lines = [
-            "=== НАЙДЕНО В ТЕКСТЕ (проверь и подтверди) ===",
-        ]
+        lines = ["=== НАЙДЕНО В ТЕКСТЕ (проверь и подтверди) ==="]
+
+        # v6.7.4: Безопасная проверка classification
+        classified_type = ""
         if classification:
-            classified_type = classification.get("tender_type", "").lower()
+            classified_type = (classification.get("tender_type") or "").lower()
             lines.append(f"=== КЛАССИФИКАЦИЯ: {classified_type} ===")
             if classified_type == "education":
-                lines.append("⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count")
+                lines.append(
+                    "⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count"
+                )
             elif classified_type == "opr":
                 lines.append("⚠️ КРИТИЧЕСКО: Это ОПР, НЕ СОУТ. rm_total = 0.")
             lines.append("")
 
+        # Поля из extracted_params
         fields = [
             ("Рабочих мест (РМ)", getattr(extracted_params, "rm_total", None)),
             ("Слушателей", getattr(extracted_params, "students_count", None)),
@@ -256,28 +212,11 @@ class LlmWrapper:
             if value is not None and value > 0:
                 lines.append(f"- {label}: {value}{suffix}")
 
-        # v6.7.1: Добавляем classification в user_message
-        if classification:
-            lines.extend(
-                [
-                    "",
-                    f"=== ПРЕДВАРИТЕЛЬНАЯ КЛАССИФИКАЦИЯ ===",
-                    f"Тип: {classification.get('tender_type', 'не определён')}",
-                    f"Уверенность: {classification.get('confidence', 0)}",
-                    f"Обоснование: {classification.get('reasoning', '')}",
-                    "",
-                    "ВАЖНО: Используй предварительную классификацию как основу. "
-                    "Если извлечение параметров даёт другой тип — проверь внимательно.",
-                ]
-            )
-
-        classified_type = (
-            classification.get("tender_type", "").lower().strip()
-            if classification
-            else ""
-        )
+        # Повторяем критические правила
         if classified_type == "education":
-            lines.append("⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count")
+            lines.append(
+                "⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count"
+            )
         elif classified_type == "opr":
             lines.append("⚠️ КРИТИЧЕСКО: Это ОПР, НЕ СОУТ. rm_total = 0.")
 
@@ -291,21 +230,21 @@ class LlmWrapper:
                 "4. Оцени confidence реально",
                 "",
                 "=== ТЕКСТ ДОКУМЕНТОВ ===",
-                compressed_text[:10000],
+                tender_text[:10000],
             ]
         )
 
         return "\n".join(lines)
 
     def _build_basic_user_message(
-        self, compressed_text: str, classification: Optional[dict] = None
+        self, tender_text: str, classification: Optional[dict] = None
     ) -> str:
         """Строит базовый user_message без extracted_params."""
         lines = []
         if classification:
             lines.extend(
                 [
-                    f"=== ПРЕДВАРИТЕЛЬНАЯ КЛАССИФИКАЦИЯ ===",
+                    "=== ПРЕДВАРИТЕЛЬНАЯ КЛАССИФИКАЦИЯ ===",
                     f"Тип: {classification.get('tender_type', 'не определён')}",
                     f"Уверенность: {classification.get('confidence', 0)}",
                     "",
@@ -314,19 +253,18 @@ class LlmWrapper:
                 ]
             )
         lines.append("=== ТЕКСТ ДОКУМЕНТОВ ===")
-        lines.append(compressed_text[:12000])
+        lines.append(tender_text[:12000])
         return "\n".join(lines)
 
     def _parse_llm_response(self, result) -> Optional[dict]:
-        """Парсит ответ LLM: JSON → key-value fallback. v6.7.1: YAML удалён."""
+        """Парсит ответ LLM. Возвращает dict или None."""
         if isinstance(result, dict):
-            return result
+            return self._normalize_parsed(result)
         if not isinstance(result, str):
             return None
 
         text = result.strip()
         if not text:
-            logger.warning("[LLM] Пустой ответ от модели")
             return None
 
         # Проверка на отказ
@@ -342,45 +280,40 @@ class LlmWrapper:
                 logger.warning(f"[LLM] Модель отказалась: {text[:100]}")
                 return None
 
-        # === Шаг 1: Убираем markdown ===
+        # Убираем markdown
         text = re.sub(r"```[a-z]*\s*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"```\s*", "", text)
         text = re.sub(r"^json\s*", "", text, flags=re.IGNORECASE)
         text = text.strip()
 
-        # === Шаг 2: JSON (приоритет) ===
+        # JSON
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
-                logger.info(
-                    f"[LLM] JSON распарсен: confidence={parsed.get('confidence', 0)}"
-                )
                 return self._normalize_parsed(parsed)
         except json.JSONDecodeError:
             pass
 
-        # === Шаг 3: JSON внутри текста ===
+        # JSON внутри текста
         json_match = re.search(r"\{.*\}", text, re.DOTALL)
         if json_match:
             try:
                 parsed = json.loads(json_match.group(0))
                 if isinstance(parsed, dict):
-                    logger.info("[LLM] JSON извлечён из текста")
                     return self._normalize_parsed(parsed)
             except json.JSONDecodeError:
                 pass
 
-        # v6.7.1: YAML fallback УДАЛЁН — только key-value
+        # Fallback key-value
         parsed = self._parse_key_value_fallback(text)
         if parsed:
-            logger.info("[LLM] Fallback key-value")
             return self._normalize_parsed(parsed)
 
         logger.warning(f"[LLM] Не удалось распарсить: {text[:200]}...")
         return None
 
     def _parse_key_value_fallback(self, text: str) -> Optional[dict]:
-        """Fallback: парсит ключ-значение из текста LLM-ответа."""
+        """Fallback: парсит ключ-значение из текста."""
         result = {
             "tender_type": "",
             "variant": 1,
@@ -428,7 +361,6 @@ class LlmWrapper:
             "is_seasonal": False,
         }
 
-        # Паттерны для числовых полей
         num_patterns = [
             ("tender_type", r"tender_type\s*[:=]\s*([^,}\n]+)"),
             ("students_count", r"students_count\s*[:=]\s*(\d+)"),
@@ -510,32 +442,21 @@ class LlmWrapper:
             parsed.get("tender_type", "unknown")
         )
 
-        # Guard: students_count > 0 → всегда education (если не combined)
+        # Guard: students_count > 0 → education
         students = parsed.get("students_count", 0)
         teacher_days = parsed.get("teacher_days", 0)
         opr_positions = parsed.get("opr_positions", 0)
 
         if parsed.get("tender_type") == "соут" and (students > 0 or teacher_days > 0):
             if opr_positions > 0:
-                logger.warning(
-                    f"[LLM Guard] 'соут' при students={students}, opr_positions={opr_positions} → 'combined'"
-                )
                 parsed["tender_type"] = "комбинированный"
             else:
-                logger.warning(
-                    f"[LLM Guard] 'соут' при students={students}, teacher_days={teacher_days} → 'education'"
-                )
                 parsed["tender_type"] = "обучение"
                 parsed["rm_total"] = 0
                 parsed["rm_category_1"] = 0
                 parsed["rm_category_2"] = 0
                 parsed["opr_positions"] = 0
                 parsed["opr_persons"] = 0
-
-        # Извлекаем reasoning для логов
-        reasoning = parsed.get("reasoning", "")
-        if reasoning:
-            logger.info(f"[LLM Reasoning] {str(reasoning)[:200]}...")
 
         # Нормализация confidence
         confidence = parsed.get("confidence", 0)
@@ -549,12 +470,11 @@ class LlmWrapper:
             else:
                 confidence = 0.1
             parsed["confidence"] = confidence
-            logger.info(f"[LLM] Auto-confidence: {confidence} (filled={filled})")
 
         return parsed
 
     def validate_rm(self, llm_result: dict, extracted_rm: int) -> Tuple[bool, int]:
-        """Валидация РМ от LLM. Возвращает (needs_review, validated_rm)."""
+        """Валидация РМ от LLM."""
         if not llm_result or not isinstance(llm_result, dict):
             return False, extracted_rm or 0
 
@@ -579,17 +499,9 @@ class LlmWrapper:
         if extracted_rm > 0 and llm_confidence < 0.3:
             ratio = max(llm_rm, extracted_rm) / min(llm_rm, extracted_rm)
             if ratio > 3:
-                logger.warning(
-                    f"⚠️ Расхождение при низком confidence: LLM={llm_rm} vs {extracted_rm} "
-                    f"(confidence={llm_confidence:.2f}, ratio={ratio:.1f})"
-                )
                 return True, extracted_rm
 
         if llm_rm > 200 and llm_confidence < 0.3:
-            logger.warning(
-                f"⚠️ ФАНТОМНЫЕ РМ: rm_total={llm_rm}, confidence={llm_confidence:.2f} < 0.3. "
-                f"Игнорируем LLM, используем extracted={extracted_rm}"
-            )
             return True, extracted_rm or 0
 
         return False, llm_rm
