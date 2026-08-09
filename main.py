@@ -260,7 +260,7 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
     logger.info("=" * 60)
 
     # ← v6.6-r2: Обновлённый импорт
-    searcher = create_searcher(parsing_only=True)
+    searcher = create_searcher()
 
     output_file = f"data/search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     results = searcher.search_and_save(
@@ -283,7 +283,19 @@ def run_analyze(
     logger.info("=" * 60)
 
     from config.settings import settings
-    from core.tender_cache import TenderCache
+    try:
+        try:
+            from core.tender_cache import TenderCache
+            HAS_TENDER_CACHE = True
+        except ModuleNotFoundError:
+            TenderCache = None
+            HAS_TENDER_CACHE = False
+            logger.debug("core.tender_cache не найден, кэширование отключено")
+        HAS_TENDER_CACHE = True
+    except ModuleNotFoundError:
+        TenderCache = None
+        HAS_TENDER_CACHE = False
+        logger.debug("core.tender_cache не найден, кэширование отключено")
 
     errors = settings.validate()
     if errors:
@@ -293,16 +305,19 @@ def run_analyze(
         sys.exit(1)
 
     # ← v6.6-r2: Обновлённые импорты
-    searcher = create_searcher(parsing_only=False)
+    searcher = create_searcher()
     analyzer = TenderAnalyzer()
 
     cache = None
-    try:
-        cache_db = Path(__file__).resolve().parent / "data" / "tender_cache.db"
-        cache = TenderCache(db_path=cache_db)
-        logger.info(f"📂 Кэш: {cache_db}")
-    except Exception as e:
-        logger.warning(f"⚠️ Кэш не инициализирован: {e}")
+    if HAS_TENDER_CACHE:
+        try:
+            cache_db = Path(__file__).resolve().parent / "data" / "tender_cache.db"
+            cache = TenderCache(db_path=cache_db)
+            logger.info(f"📂 Кэш: {cache_db}")
+        except Exception as e:
+            logger.warning(f"⚠️ Кэш не инициализирован: {e}")
+    else:
+        logger.info("📂 Кэш отключен (модуль tender_cache не найден)")
 
     detailed = None
     if not skip_detail:
@@ -487,7 +502,6 @@ def run_analyze(
 
             analysis = analyzer.analyze(
                 tender_text=tender_text,
-                tender_id=tender.tender_id,
                 nmck=tender.nmck,
                 region=detail.customer_region if detail else tender.region,
                 procurement_method=detail.purchase_method if detail else tender.etp,

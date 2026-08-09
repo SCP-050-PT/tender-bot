@@ -184,88 +184,9 @@ class LlmWrapper:
         )
         return "\n".join(lines)
 
-    def _compress_text(self, text: str, classification: Optional[dict] = None) -> str:
-        """Умное сжатие текста: зоны А/Б/В. v6.7.1: улучшенные паттерны."""
-        lines = text.split("\n")
-        zone_a = []
-        zone_b = []
-        zone_c = []
-
-        # v6.7.1: Расширенные паттерны зоны А
-        zone_a_patterns = [
-            r"количество\s*[:=]",
-            r"кол-во\s*[:=]",
-            r"обучаемых",
-            r"рабочих\s*мест",
-            r"слушател",
-            r"стоимость\s*[:=]",
-            r"цена\s*[:=]",
-            r"срок\s*исполнен",
-            r"дата\s*окончан",
-            r"адрес",
-            r"город",
-            r"регион",
-            r"протокол\s*специальной\s*оценки",
-            r"комплект\s*протоколов",
-            r"карта\s*условий\s*труда",
-            r"оценка\s*проф\s*рисков",
-            r"специальная\s*оценка",
-            r"переподготовка",
-            r"повышение\s*квалификации",
-            r"дополнительная\s*проф\s*программа",
-        ]
-
-        zone_c_patterns = [
-            r"^[\s\d\.]*$",
-            r"статья\s*\d+",
-            r"федеральн\w+\s*закон",
-            r"постановлени\w+\s*правительства",
-            r"приложение\s*\d+",
-            r"лист\s*\d+\s*из\s*\d+",
-            r"^\d{2}\.\d{2}\.\d{4}$",  # даты
-            r"^\d{4,}$",  # длинные числа (ID, телефоны)
-            r"ИНН|ОГРН|КПП|БИК",
-        ]
-
-        for line in lines:
-            line_stripped = line.strip()
-            if not line_stripped or len(line_stripped) < 3:
-                continue
-
-            is_zone_a = any(
-                re.search(p, line_stripped, re.IGNORECASE) for p in zone_a_patterns
-            )
-            is_zone_c = any(
-                re.search(p, line_stripped, re.IGNORECASE) for p in zone_c_patterns
-            )
-
-            if is_zone_a:
-                zone_a.append(line_stripped)
-            elif is_zone_c:
-                zone_c.append(line_stripped)
-            else:
-                zone_b.append(line_stripped)
-
-        result = []
-        if zone_a:
-            result.append("=== КЛЮЧЕВЫЕ ДАННЫЕ ===")
-            result.extend(zone_a[:150])  # v6.7.1: больше ключевых данных
-
-        if zone_b:
-            result.append("\n=== КОНТЕКСТ ===")
-            result.extend(zone_b[:300])  # v6.7.1: больше контекста
-
-        if zone_c:
-            result.append("\n=== ДЕТАЛИ ===")
-            zone_c_compressed = self._compress_repeats(zone_c)
-            result.extend(zone_c_compressed[:30])
-
-        compressed = "\n".join(result)
-        logger.info(
-            f"[v6.7.1] Текст сжат: {len(text)} → {len(compressed)} симв. "
-            f"(A={len(zone_a)}, B={len(zone_b)}, C={len(zone_c)})"
-        )
-        return compressed
+    def _compress_text(self, text: str) -> str:
+        """v6.7.3: Сжатие отключено (эффективность 4%, не стоит сложности)."""
+        return text
 
     def _compress_repeats(self, lines: List[str]) -> List[str]:
         """Сжимает повторяющиеся строки."""

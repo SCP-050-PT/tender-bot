@@ -2,37 +2,15 @@
 core/calculation/sout_calculator.py
 Расчёт цены для клиента на СОУТ (3 варианта).
 Вынесено из calculator.py (v6.5).
+ИСПРАВЛЕНО (v6.7.3):
+  - Убран дублирующийся CalculationResult (импорт из calculation_result.py)
 """
 
 from typing import Literal
-from dataclasses import dataclass
 from loguru import logger
 
 from core.calculation.cost_loader import load_costs
-
-
-@dataclass
-class CalculationResult:
-    cost_price: float
-    recommended_price: float
-    margin_percent: float
-    margin_rub: float
-    transport_cost: float
-    subcontractor_cost: float
-    guarantee_cost: float = 0.0
-    details: dict = None
-
-    def to_dict(self) -> dict:
-        return {
-            "cost_price": round(self.cost_price, 2),
-            "recommended_price": round(self.recommended_price, 2),
-            "margin_percent": round(self.margin_percent, 2),
-            "margin_rub": round(self.margin_rub, 2),
-            "transport_cost": round(self.transport_cost, 2),
-            "subcontractor_cost": round(self.subcontractor_cost, 2),
-            "guarantee_cost": round(self.guarantee_cost, 2),
-            "details": self.details,
-        }
+from core.calculation.calculation_result import CalculationResult
 
 
 class SoutCalculator:
@@ -77,14 +55,22 @@ class SoutCalculator:
         delivery_cost = self._calc_delivery(delivery_count, is_annual)
 
         # === Командировочные ===
-        travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = \
-            self._calc_travel(trip_days, regions_count, transport_cost, is_seasonal, cities_count)
+        travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
+            self._calc_travel(
+                trip_days, regions_count, transport_cost, is_seasonal, cities_count
+            )
+        )
 
         # === Итого ===
         cost_price = (
-            price + materials_cost + delivery_cost
-            + travel_cost_auto + measurer_and_daily + accommodation_cost_auto
-            + flight_cost + subcontractor_cost
+            price
+            + materials_cost
+            + delivery_cost
+            + travel_cost_auto
+            + measurer_and_daily
+            + accommodation_cost_auto
+            + flight_cost
+            + subcontractor_cost
         )
 
         margin_percent = 10.0
@@ -97,6 +83,12 @@ class SoutCalculator:
             margin_rub = recommended_price - cost_price
             margin_percent = (margin_rub / cost_price) * 100 if cost_price > 0 else 0
 
+        review_reason = ""
+        if needs_manual_review_iii:
+            review_reason = (
+                "ИИИ в ТЗ, но кол-во РМ не указано — требуется ручная проверка."
+            )
+
         return CalculationResult(
             cost_price=cost_price,
             recommended_price=recommended_price,
@@ -105,6 +97,8 @@ class SoutCalculator:
             transport_cost=travel_cost_auto + flight_cost,
             subcontractor_cost=subcontractor_cost,
             guarantee_cost=0,
+            needs_manual_review=needs_manual_review_iii,
+            review_reason=review_reason,
             details={
                 "type": "sout",
                 "variant": variant,
@@ -145,7 +139,9 @@ class SoutCalculator:
             return min_cost, True
         return 0, False
 
-    def _calc_main_price(self, rm_total: int, rm_cat_1: int, rm_cat_2: int, variant: int) -> float:
+    def _calc_main_price(
+        self, rm_total: int, rm_cat_1: int, rm_cat_2: int, variant: int
+    ) -> float:
         """Основной расчёт по варианту СОУТ."""
         if variant == 1:
             main_rm = max(2, int(rm_total * 0.2))
@@ -162,20 +158,30 @@ class SoutCalculator:
                 + analogy_rm * self.cat["1"]["analogy_cost"]
             )
         elif variant == 2:
-            cards_cost = rm_cat_1 * self.cat["1"]["full_cost"] + rm_cat_2 * self.cat["2"]["full_cost"]
+            cards_cost = (
+                rm_cat_1 * self.cat["1"]["full_cost"]
+                + rm_cat_2 * self.cat["2"]["full_cost"]
+            )
             analogy_rm = rm_total - (rm_cat_1 + rm_cat_2)
             return cards_cost + analogy_rm * 200
         else:  # variant == 3
-            cards_cost = rm_cat_1 * self.cat["1"]["card_cost"] + rm_cat_2 * self.cat["2"]["card_cost"]
+            cards_cost = (
+                rm_cat_1 * self.cat["1"]["card_cost"]
+                + rm_cat_2 * self.cat["2"]["card_cost"]
+            )
             remaining_rm = max(0, rm_total - rm_cat_1 - rm_cat_2)
             protocol_sets = max(2, int(remaining_rm * 0.2))
-            return cards_cost + protocol_sets * self.costs["analogy_protocol_set"]["cost"]
+            return (
+                cards_cost + protocol_sets * self.costs["analogy_protocol_set"]["cost"]
+            )
 
     def _calc_materials(self) -> float:
         """Расчёт материалов."""
         return (
-            self.costs["materials"]["paper_a4"]["cost"] * self.costs["materials"]["paper_a4"]["default_quantity"]
-            + self.costs["materials"]["ink_per_page"]["cost"] * self.costs["materials"]["ink_per_page"]["default_quantity"]
+            self.costs["materials"]["paper_a4"]["cost"]
+            * self.costs["materials"]["paper_a4"]["default_quantity"]
+            + self.costs["materials"]["ink_per_page"]["cost"]
+            * self.costs["materials"]["ink_per_page"]["default_quantity"]
         )
 
     def _calc_delivery(self, delivery_count: int, is_annual: bool) -> float:
@@ -184,8 +190,12 @@ class SoutCalculator:
         return actual_delivery * self.costs["delivery"]["post_russia"]["cost"]
 
     def _calc_travel(
-        self, trip_days: int, regions_count: int, transport_cost: float,
-        is_seasonal: bool, cities_count: int
+        self,
+        trip_days: int,
+        regions_count: int,
+        transport_cost: float,
+        is_seasonal: bool,
+        cities_count: int,
     ) -> tuple:
         """Расчёт командировочных. Возвращает (travel_auto, measurer_daily, accommodation, flight)."""
         seasonal_mult = self.travel.get("seasonal_multiplier", 2) if is_seasonal else 1
@@ -197,7 +207,9 @@ class SoutCalculator:
 
         travel_cost_auto = fixed_trip * trips * seasonal_mult
         measurer_and_daily = daily_measurer_rate * trip_days * trips * seasonal_mult
-        accommodation_cost_auto = max(0, trip_days - 1) * trips * accommodation_rate * seasonal_mult
+        accommodation_cost_auto = (
+            max(0, trip_days - 1) * trips * accommodation_rate * seasonal_mult
+        )
         flight_cost = transport_cost if transport_cost > 0 else 0
 
         if cities_count > 5 and regions_count == 1:
@@ -213,4 +225,9 @@ class SoutCalculator:
             f"билеты={flight_cost}"
         )
 
-        return travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost
+        return (
+            travel_cost_auto,
+            measurer_and_daily,
+            accommodation_cost_auto,
+            flight_cost,
+        )

@@ -2,36 +2,14 @@
 core/calculation/plk_opr_calculators.py
 Расчёт цены для клиента на ПЛК и ОПР.
 Вынесено из calculator.py (v6.5).
+ИСПРАВЛЕНО (v6.7.3):
+  - Убран дублирующийся CalculationResult (импорт из calculation_result.py)
 """
 
-from dataclasses import dataclass
 from loguru import logger
 
 from core.calculation.cost_loader import load_costs
-
-
-@dataclass
-class CalculationResult:
-    cost_price: float
-    recommended_price: float
-    margin_percent: float
-    margin_rub: float
-    transport_cost: float
-    subcontractor_cost: float
-    guarantee_cost: float = 0.0
-    details: dict = None
-
-    def to_dict(self) -> dict:
-        return {
-            "cost_price": round(self.cost_price, 2),
-            "recommended_price": round(self.recommended_price, 2),
-            "margin_percent": round(self.margin_percent, 2),
-            "margin_rub": round(self.margin_rub, 2),
-            "transport_cost": round(self.transport_cost, 2),
-            "subcontractor_cost": round(self.subcontractor_cost, 2),
-            "guarantee_cost": round(self.guarantee_cost, 2),
-            "details": self.details,
-        }
+from core.calculation.calculation_result import CalculationResult
 
 
 class PlkCalculator:
@@ -55,14 +33,18 @@ class PlkCalculator:
         measurer_cost = points_count * self.costs["labor"]["measurer_per_point"]["cost"]
 
         materials_cost = (
-            self.costs["materials"]["paper_a4"]["cost"] * self.costs["materials"]["paper_a4"]["default_quantity"]
-            + self.costs["materials"]["ink_per_page"]["cost"] * self.costs["materials"]["ink_per_page"]["default_quantity"]
+            self.costs["materials"]["paper_a4"]["cost"]
+            * self.costs["materials"]["paper_a4"]["default_quantity"]
+            + self.costs["materials"]["ink_per_page"]["cost"]
+            * self.costs["materials"]["ink_per_page"]["default_quantity"]
         )
 
         actual_delivery = 12 if is_annual else delivery_count
         delivery_cost = actual_delivery * self.costs["delivery"]["post_russia"]["cost"]
 
-        subcontractor_cost = self.costs["subcontractor"]["default_cost"] if needs_subcontractor else 0
+        subcontractor_cost = (
+            self.costs["subcontractor"]["default_cost"] if needs_subcontractor else 0
+        )
 
         travel = self.costs["travel"]
         if transport_cost == 0 and points_count > 0:
@@ -72,8 +54,14 @@ class PlkCalculator:
         daily_allowance = travel["daily_allowance"]
 
         cost_price = (
-            points_cost + measurer_cost + materials_cost + delivery_cost
-            + subcontractor_cost + transport_cost + accommodation_cost + daily_allowance
+            points_cost
+            + measurer_cost
+            + materials_cost
+            + delivery_cost
+            + subcontractor_cost
+            + transport_cost
+            + accommodation_cost
+            + daily_allowance
         )
 
         margin_percent = 10.0
@@ -124,8 +112,10 @@ class OprCalculator:
     ) -> CalculationResult:
         """Расчёт цены для клиента на ОПР."""
         materials_cost = (
-            self.costs["materials"]["paper_a4"]["cost"] * self.costs["materials"]["paper_a4"]["default_quantity"]
-            + self.costs["materials"]["ink_per_page"]["cost"] * self.costs["materials"]["ink_per_page"]["default_quantity"]
+            self.costs["materials"]["paper_a4"]["cost"]
+            * self.costs["materials"]["paper_a4"]["default_quantity"]
+            + self.costs["materials"]["ink_per_page"]["cost"]
+            * self.costs["materials"]["ink_per_page"]["default_quantity"]
         )
 
         sot_cost = rm_count * self.costs["labor"]["sot_per_rm"]["cost"]
@@ -143,8 +133,13 @@ class OprCalculator:
         delivery_cost = delivery_count * self.costs["delivery"]["post_russia"]["cost"]
 
         cost_price = (
-            materials_cost + sot_cost + processing_cost + program_cost
-            + additional_cost + delivery_cost + transport_cost
+            materials_cost
+            + sot_cost
+            + processing_cost
+            + program_cost
+            + additional_cost
+            + delivery_cost
+            + transport_cost
         )
 
         margin_percent = 30.0

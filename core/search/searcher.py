@@ -28,7 +28,7 @@ from core.http_session import (
     get_platform_from_ua,
 )
 from utils.price_parser import get_price_parser
-from core.risk_rules import _load_risk_rules
+from core.risk_rules import RiskAnalyzer
 
 from core.search.url_builder import SearchUrlBuilder
 from core.search.filters import TenderFilters
@@ -48,10 +48,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ← v6.3.1: Загрузка exclude_keywords из risk_rules.yaml
 def _load_exclude_keywords() -> List[str]:
-    """Загружает exclude_keywords из risk_rules.yaml, fallback на inline."""
     try:
-        rules = _load_risk_rules()
-        forbidden = rules.get("forbidden_directions", [])
+        analyzer = RiskAnalyzer()
+        forbidden = analyzer.rules.get("forbidden_directions", [])
         keywords = []
         for item in forbidden:
             pattern = item.get("pattern", "")
@@ -89,8 +88,8 @@ def _load_exclude_keywords() -> List[str]:
 def _load_context_exceptions() -> List[str]:
     """Загружает allow_if_types из risk_rules.yaml для контекстной проверки."""
     try:
-        rules = _load_risk_rules()
-        forbidden = rules.get("forbidden_directions", [])
+        analyzer = RiskAnalyzer()
+        forbidden = analyzer.rules.get("forbidden_directions", [])
         exceptions = set()
         for item in forbidden:
             allowed = item.get("allow_if_types", [])
@@ -145,11 +144,9 @@ class TenderSearcher:
         self,
         config: Optional[Dict] = None,
         proxy: Optional[str] = None,
-        parsing_only: bool = True,
     ):
         self.config = config or SEARCH_CONFIG
         self.proxy = proxy
-        self.parsing_only = parsing_only
 
         # Подсистемы
         self.url_builder = SearchUrlBuilder(config=self.config)
@@ -168,8 +165,7 @@ class TenderSearcher:
         self._base_delay = 5
 
         logger.info(
-            f"🔍 TenderSearcher initialized (parsing_only={parsing_only}, "
-            f"{len(self._sessions)} sessions)"
+            f"🔍 TenderSearcher initialized ({len(self._sessions)} sessions)"
         )
 
     def _get_session(self, index: int = 0) -> Any:
@@ -385,9 +381,6 @@ class TenderSearcher:
         max_results: Optional[int] = None,
     ) -> List[Dict]:
         """Поиск с сохранением результатов."""
-        if not self.parsing_only:
-            logger.warning("parsing_only=False, но вызван search_and_save()")
-
         logger.info(f"\n{'='*60}")
         logger.info(f"🔍 РЕЖИМ ТОЛЬКО ПАРСИНГА")
         logger.info(f"📋 Фильтр НМЦК: ≥{self.config.get('min_nmck', 100000):,}₽")
@@ -449,13 +442,10 @@ class TenderSearcher:
 
 
 def create_searcher(
-    parsing_only: bool = True,
     proxy: Optional[str] = None,
     config: Optional[Dict] = None,
 ) -> TenderSearcher:
-    """Фабрика для создания TenderSearcher."""
     return TenderSearcher(
         config=config,
         proxy=proxy,
-        parsing_only=parsing_only,
     )

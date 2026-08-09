@@ -208,25 +208,11 @@ class DocumentProcessor:
             logger.error(f"Ошибка скачивания: {e}")
             return None
 
-    def _validate_file(self, file_path: Path, file_type: str) -> bool:
-        """Проверяет магические байты файла."""
-        try:
-            with open(file_path, "rb") as f:
-                header = f.read(8)
-
-            ext = (file_type.lower() if file_type else file_path.suffix.lower()).lstrip(".")
-
-            if ext == "pdf" and not header.startswith(b"%PDF"):
-                logger.error(f"Файл {file_path.name} — не PDF")
-                return False
-            elif ext in ["zip", "docx", "xlsx"] and not header.startswith(b"PK\x03\x04"):
-                logger.error(f"Файл {file_path.name} — не ZIP")
-                return False
-
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка проверки файла: {e}")
-            return False
+    def _validate_file(self, file_path: Path) -> tuple:
+        real_format = self._detect_by_magic(file_path)
+        if real_format == "unknown":
+            return False, "unknown", "Неизвестный формат"
+        return True, real_format, ""
 
     def _extract_text(self, file_path: Path, file_type: str, doc_name: str) -> str:
         """Делегирует извлечение специализированному экстрактору."""
