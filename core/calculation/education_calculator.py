@@ -67,6 +67,7 @@ class EducationCalculator:
         has_lamination: bool = False,
         tender_text: str = "",
         llm_confidence: float = 0.0,  # v6.7.1: новый параметр
+        tender_type: str = "",
     ) -> CalculationResult:
         """
         Расчёт цены для клиента на обучение.
@@ -200,23 +201,52 @@ class EducationCalculator:
                 f"certs={actual_certificates}, diplomas={diplomas}, "
                 f"worker={worker_certs}, qual={qual_certs}, protocols={protocols_count}"
             )
-        # v6.7.2: ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА: ОТ → всегда протоколы
+            # v6.7.3-fix: УСИЛЕННЫЙ GUARD для обучения ОТ
+        # Если LLM дал qual_certs/diplomas/certificates, но это ОТ — принудительно protocols
         text_lower = tender_text.lower()
-        if "охрана труда" in text_lower or "обучение охране труда" in text_lower:
-            if protocols_count == 0 and (
-                qual_certs > 0 or diplomas > 0 or actual_certificates > 0
-            ):
-                forced_count = qual_certs or diplomas or actual_certificates
+        is_ot_context = (
+            "охрана труда" in text_lower
+            or "обучение по охране труда" in text_lower
+            or "обучение охране труда" in text_lower
+            or "протокол проверки знаний" in text_lower
+            or "протоколы проверки знаний" in text_lower
+        )
+        # v6.7.3-fix: Если тип тендера явно education, но нет явных признаков ОТ в тексте —
+        # проверяем по комбинации: нет protocols + есть другие документы = подозрительно
+        if students_count > 0 and protocols_count == 0 and total_explicit_docs > 0:
+            # LLM дал другие документы вместо protocols — проверяем, не ОТ ли это
+            # Если в тексте есть "охрана труда" или похожие — точно ОТ
+            if is_ot_context:
+                forced_count = (
+                    qual_certs
+                    or diplomas
+                    or actual_certificates
+                    or worker_certs
+                    or students_count
+                )
                 logger.warning(
-                    f"[v6.7.2] ПРИНУДИТЕЛЬНО: ОТ → protocols={forced_count}, "
-                    f"qual_certs=0, diplomas=0, certs=0"
+                    f"[v6.7.3-fix] ОТ-контекст в тексте, но protocols=0. "
+                    f"Принудительно protocols={forced_count}, сброс остальных документов"
                 )
                 protocols_count = forced_count
                 qual_certs = 0
                 diplomas = 0
                 actual_certificates = 0
-                # Пересчитаем total_explicit_docs
+                worker_certs = 0
                 total_explicit_docs = protocols_count
+                auto_detected = False
+                needs_manual_review = False
+                review_reason = ""
+            # v6.7.3-fix: Если НЕТ явного ОТ-контекста, но тип education и нет protocols —
+            # всё равно подозрительно. Ставим review для проверки.
+            elif not is_ot_context and qual_certs > 0 and "квалификация" in text_lower:
+                # Повышение квалификации без явного ОТ — оставляем как есть, но review
+                logger.info(
+                    f"[v6.7.3-fix] Повышение квалификации без ОТ-контекста: "
+                    f"qual_certs={qual_certs}, оставляем, review=True"
+                )
+                needs_manual_review = True
+                review_reason = f"Повышение квалификации ({qual_certs} чел) — проверьте, не ОТ ли это"
         # === Логирование входных параметров ===
         logger.info(
             f"[EducationCalc] ВХОД: students={students_count}, certs={actual_certificates}, "

@@ -136,7 +136,7 @@ class TenderAnalyzer:
 
         # --- Шаг 8: Guard'ы ---
         final_price, margin_percent, margin_rub, guard_flags = self._apply_guards(
-            calc_result, actual_nmck
+            calc_result, actual_nmck, tender_type  # добавить tender_type
         )
         needs_manual_review = needs_manual_review or bool(guard_flags)
 
@@ -297,24 +297,29 @@ class TenderAnalyzer:
         if students > 0 and opr_positions > 0:
             return "комбинированный"
 
-        # ← НОВОЕ: Если извлечение упало, но классификация была — используем её
+        # v6.7.2-fix: Если извлечение упало, но классификация была — используем её
         if llm_confidence == 0 and classification:
             classified_type = classification.get("tender_type", "").lower().strip()
             if classified_type and classified_type != "unknown":
                 logger.info(
-                    f"[v6.7.2] Извлечение упало, используем классификацию: {classified_type}"
+                    f"[v6.7.2-fix] Извлечение упало, используем классификацию: {classified_type}"
                 )
                 return classified_type
 
         llm_type = llm_result.get("tender_type", "соут") if llm_result else "соут"
-        # ← НОВОЕ: Если классификация сказала ОПР, а LLM сказал СОУТ — доверяем классификации
+        # v6.7.2-fix: Если классификация сказала ОПР, а LLM сказал СОУТ — доверяем классификации
         if classification and llm_confidence >= 0.7:
             classified_type = classification.get("tender_type", "").lower().strip()
             if classified_type == "opr" and llm_type in ("соут", "sout"):
-                logger.info(f"[v6.7.2] Классификация=opr, но LLM=соут → используем opr")
+                logger.info(
+                    f"[v6.7.2-fix] Классификация=opr, но LLM=соут → используем opr"
+                )
                 return "opr"
-        if llm_confidence >= 0.3:
-            return llm_type
+            if classified_type == "education" and llm_type in ("соут", "sout"):
+                logger.info(
+                    f"[v6.7.2-fix] Классификация=education, но LLM=соут → используем education"
+                )
+                return "education"
 
         if extracted_type_hint:
             return extracted_type_hint
@@ -345,20 +350,38 @@ class TenderAnalyzer:
         return result
 
     def _merge_tender_info(self, details: dict, tender_info: dict) -> dict:
+        # v6.7.3-fix: ВСЕГДА мержим rm_total из КТРУ в details (независимо от типа)
+        # Это нужно, потому что тип может быть переопределён позже классификацией
+        if tender_info.get("rm_total") and tender_info.get("rm_total") > 0:
+            details["rm_total"] = tender_info["rm_total"]
+            logger.info(
+                f"[v6.7.3-fix] КТРУ rm_total={tender_info['rm_total']} записан в details"
+            )
+
+        # v6.7.3-fix: Также безусловно мержим students_count и points_count из КТРУ
+        for ktru_field in ["students_count", "points_count", "rm_total"]:
+            if tender_info.get(ktru_field) and tender_info.get(ktru_field) > 0:
+                details[ktru_field] = tender_info[ktru_field]
+                logger.info(
+                    f"[v6.7.3-fix] КТРУ {ktru_field}={tender_info[ktru_field]} записан в details"
+                )
+
         tender_type = (details.get("tender_type", "") or "").lower()
 
         # v6.7.1: ВСЕГДА определяем int_fields ДО if/else
         int_fields = []
         if "опр" in tender_type:
-            int_fields = ["opr_positions", "opr_persons", "rm_total"]  # ← +rm_total
+            int_fields = ["opr_positions", "opr_persons"]
             if tender_info.get("opr_positions"):
                 details["opr_positions"] = tender_info["opr_positions"]
             if tender_info.get("opr_persons"):
                 details["opr_persons"] = tender_info["opr_persons"]
-            # ← НОВОЕ: КТРУ rm_total используем как fallback для opr_positions
+            # v6.7.2-fix: КТРУ даёт rm_total, но для ОПР это opr_positions
             if tender_info.get("rm_total") and details.get("opr_positions", 0) == 0:
                 details["opr_positions"] = tender_info["rm_total"]
-                logger.info(f"[v6.7.2] ОПР: opr_positions не найдено, используем КТРУ rm_total={tender_info['rm_total']}")
+                logger.info(
+                    f"[v6.7.2-fix] ОПР: opr_positions не найдено, используем КТРУ rm_total={tender_info['rm_total']}"
+                )
             logger.info("[v6.7.1] Тип=ОПР, rm_total из КТРУ используется как fallback")
         else:
             int_fields = [
@@ -620,6 +643,7 @@ class TenderAnalyzer:
                 manikin_days=details.get("manikin_days", 0),
                 tender_text=tender_text,
                 llm_confidence=llm_confidence,  # v6.7.1: передаём confidence
+                tender_type=tender_type,
             )
             # v6.7.1: needs_manual_review уже в calc_result, возвращаем как есть
             return calc_result
@@ -650,25 +674,35 @@ class TenderAnalyzer:
         elif "опр" in tt:
             opr_positions = details.get("opr_positions", 0) or 0
             opr_persons = details.get("opr_persons", 0) or 0
-            
-            # v6.7.2: Прямая проверка tender_info на случай, если _merge_tender_info не сработал
+
+            # v6.7.3-fix: Усиленный каскадный fallback для opr_positions
             if opr_positions == 0:
-                # Проверяем tender_info напрямую
-                ti_rm = tender_info.get("rm_total", 0) if tender_info else 0
-                if ti_rm > 0:
-                    opr_positions = ti_rm
-                    logger.info(f"[v6.7.2] ОПР: используем tender_info rm_total={ti_rm}")
-                elif details.get("rm_total", 0) > 0:
+                # 1. Проверяем details.rm_total (КТРУ уже тут, тип мог быть переопределён)
+                if details.get("rm_total", 0) > 0:
                     opr_positions = details["rm_total"]
-                    logger.info(f"[v6.7.2] ОПР: используем details rm_total={opr_positions}")
-            
-            # v6.7.2: Если opr_positions всё ещё 0 — используем rm_total (КТРУ или regex)
+                    logger.info(
+                        f"[v6.7.3-fix] ОПР: используем details rm_total={opr_positions}"
+                    )
+                # 2. Проверяем tender_info напрямую
+                elif tender_info and tender_info.get("rm_total", 0) > 0:
+                    opr_positions = tender_info["rm_total"]
+                    logger.info(
+                        f"[v6.7.3-fix] ОПР: используем tender_info rm_total={opr_positions}"
+                    )
+                # 3. Проверяем extracted_rm
+                elif tender_info and tender_info.get("extracted_rm", 0) > 0:
+                    opr_positions = tender_info["extracted_rm"]
+                    logger.info(
+                        f"[v6.7.3-fix] ОПР: используем extracted_rm={opr_positions}"
+                    )
+
+            # v6.7.2: Если opr_positions всё ещё 0 — последний fallback
             if opr_positions == 0:
                 rm_total = details.get("rm_total", 0) or 0
                 if rm_total > 0:
                     opr_positions = rm_total
                     logger.info(f"[v6.7.2] ОПР: opr_positions=0, используем rm_total={rm_total}")
-            
+
             # v6.7.2: Если всё ещё 0 — ручная проверка
             if opr_positions == 0:
                 logger.warning("[v6.7.2] ОПР: количество не определено, needs_manual_review=True")
@@ -683,7 +717,7 @@ class TenderAnalyzer:
                     needs_manual_review=True,
                     review_reason="ОПР: количество должностей/человек не определено из текста",
                 )
-            
+
             return self.calc.calculate_opr(
                 rm_count=opr_positions,
                 delivery_count=details.get("delivery_count", 1),
@@ -731,7 +765,7 @@ class TenderAnalyzer:
     # ============ GUARD'Ы ============
 
     def _apply_guards(
-        self, calc_result, nmck: float
+        self, calc_result, nmck: float, tender_type: str = ""  # добавить tender_type
     ) -> Tuple[float, float, float, list]:
         """Применяет guard'ы к результату расчёта."""
         final_price = calc_result.recommended_price
@@ -762,14 +796,23 @@ class TenderAnalyzer:
                 f"Скорректировано до {final_price:,.0f}₽."
             )
 
+        # v6.7.3-fix: Для ОПР с малой себестоимостью НЕ добавляем guard-флаг
+        is_opr = "опр" in tender_type.lower()
         if margin_percent > 200:
-            logger.error(
-                f"🚨 GUARD: margin={margin_percent:.1f}% > 200%. "
-                f"Аномально высокая маржа."
-            )
-            guard_flags.append(
-                f"🚨 Аномально высокая маржа: {margin_percent:.1f}%. Проверьте количество."
-            )
+            if is_opr and calc_result.cost_price < 50000:
+                logger.info(
+                    f"[v6.7.3-fix] ОПР: пропускаем guard margin>{margin_percent:.1f}% "
+                    f"(себестоимость {calc_result.cost_price:,.0f}₽ < 50к)"
+                )
+                # НЕ добавляем в guard_flags
+            else:
+                logger.error(
+                    f"🚨 GUARD: margin={margin_percent:.1f}% > 200%. "
+                    f"Аномально высокая маржа."
+                )
+                guard_flags.append(
+                    f"🚨 Аномально высокая маржа: {margin_percent:.1f}%. Проверьте количество."
+                )
 
         if getattr(calc_result, "needs_manual_review", False):
             guard_flags.append(f"⚠️ {calc_result.review_reason}")

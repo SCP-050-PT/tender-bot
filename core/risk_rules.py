@@ -334,27 +334,43 @@ class RiskAnalyzer:
                 {
                     "name": "Рекомендуемая цена превышает НМЦК",
                     "level": "high",
-                    "message": f"Рекомендуемая цена {recommended_price:,.0f}₽ превышает НМЦК {nmck:,.0f}₽ — заявка будет отклонена",
+                    "message": f"Рекомендуемая цена {recommended_price:ф,.0f}₽ превышает НМЦК {nmck:,.0f}₽ — заявка будет отклонена",
                 }
             )
 
         # ← v6.5: GUARD — аномально высокая маржа
         if margin_percent > self.thresholds.get("max_margin_percent", 200.0):
-            flags.append(
-                {
-                    "name": "Аномально высокая маржа",
-                    "level": "high",
-                    "message": f"Маржа {margin_percent:.1f}% аномально высокая (порог {self.thresholds.get('max_margin_percent', 200)}%) — проверьте количество и вариант расчёта",
-                }
-            )
+            # v6.7.3-fix: Для ОПР с малой себестоимостью высокая маржа — норма
+            is_opr = tender_type and tender_type.lower() in ("opr", "опр")
+            if is_opr and cost_price < 50000:
+                logger.info(
+                    f"[v6.7.3-fix] ОПР с себестоимостью {cost_price:,.0f}₽ — "
+                    f"маржа {margin_percent:.1f}% не считаем аномалией"
+                )
+            else:
+                flags.append(
+                    {
+                        "name": "Аномально высокая маржа",
+                        "level": "high",
+                        "message": f"Маржа {margin_percent:.1f}% аномально высокая (порог {self.thresholds.get('max_margin_percent', 200)}%) — проверьте количество и вариант расчёта",
+                    }
+                )
         elif margin_percent > self.thresholds.get("high_margin_percent", 100.0):
-            flags.append(
-                {
-                    "name": "Высокая маржа — проверьте расчёт",
-                    "level": "medium",
-                    "message": f"Маржа {margin_percent:.1f}% выше нормы (порог {self.thresholds.get('high_margin_percent', 100)}%) — проверьте корректность",
-                }
-            )
+            # v6.7.3-fix: Для ОПР с малой себестоимостью тоже исключаем
+            is_opr = tender_type and tender_type.lower() in ("opr", "опр")
+            if is_opr and cost_price < 50000:
+                logger.info(
+                    f"[v6.7.3-fix] ОПР с себестоимостью {cost_price:,.0f}₽ — "
+                    f"маржа {margin_percent:.1f}% не считаем высокой"
+                )
+            else:
+                flags.append(
+                    {
+                        "name": "Высокая маржа — проверьте расчёт",
+                        "level": "medium",
+                        "message": f"Маржа {margin_percent:.1f}% выше нормы (порог {self.thresholds.get('high_margin_percent', 100)}%) — проверьте корректность",
+                    }
+                )
 
         # ← v6.5: НОВАЯ ЛОГИКА НМЦК vs себестоимость
         if cost_price > 0 and nmck > 0:
