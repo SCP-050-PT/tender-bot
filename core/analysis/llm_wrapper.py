@@ -184,7 +184,7 @@ class LlmWrapper:
         )
         return "\n".join(lines)
 
-    def _compress_text(self, text: str) -> str:
+    def _compress_text(self, text: str, classification=None) -> str:
         """v6.7.3: Сжатие отключено (эффективность 4%, не стоит сложности)."""
         return text
 
@@ -271,7 +271,11 @@ class LlmWrapper:
                 ]
             )
 
-        classified_type = classification.get("tender_type", "").lower()
+        classified_type = (
+            classification.get("tender_type", "").lower().strip()
+            if classification
+            else ""
+        )
         if classified_type == "education":
             lines.append("⚠️ КРИТИЧЕСКО: 'охрана труда' → protocols_count = students_count")
         elif classified_type == "opr":

@@ -283,19 +283,7 @@ def run_analyze(
     logger.info("=" * 60)
 
     from config.settings import settings
-    try:
-        try:
-            from core.tender_cache import TenderCache
-            HAS_TENDER_CACHE = True
-        except ModuleNotFoundError:
-            TenderCache = None
-            HAS_TENDER_CACHE = False
-            logger.debug("core.tender_cache не найден, кэширование отключено")
-        HAS_TENDER_CACHE = True
-    except ModuleNotFoundError:
-        TenderCache = None
-        HAS_TENDER_CACHE = False
-        logger.debug("core.tender_cache не найден, кэширование отключено")
+    from core.tender_cache import TenderCache
 
     errors = settings.validate()
     if errors:
@@ -309,15 +297,12 @@ def run_analyze(
     analyzer = TenderAnalyzer()
 
     cache = None
-    if HAS_TENDER_CACHE:
-        try:
-            cache_db = Path(__file__).resolve().parent / "data" / "tender_cache.db"
-            cache = TenderCache(db_path=cache_db)
-            logger.info(f"📂 Кэш: {cache_db}")
-        except Exception as e:
-            logger.warning(f"⚠️ Кэш не инициализирован: {e}")
-    else:
-        logger.info("📂 Кэш отключен (модуль tender_cache не найден)")
+    try:
+        cache_db = Path(__file__).resolve().parent / "data" / "tender_cache.db"
+        cache = TenderCache(db_path=cache_db)
+        logger.info(f"📂 Кэш: {cache_db}")
+    except Exception as e:
+        logger.warning(f"⚠️ Кэш не инициализирован: {e}")
 
     detailed = None
     if not skip_detail:
@@ -501,13 +486,9 @@ def run_analyze(
             )
 
             analysis = analyzer.analyze(
-                tender_text=tender_text,
                 nmck=tender.nmck,
                 region=detail.customer_region if detail else tender.region,
-                procurement_method=detail.purchase_method if detail else tender.etp,
-                etp=detail.platform_name if detail else tender.etp,
-                deadline_date=detail.deadline_date if detail else tender.deadline_date,
-                law_type=tender.law.replace("-FZ", "") if tender.law else "44",
+                tender_text=tender_text,
                 tender_info=tender_info,
             )
 

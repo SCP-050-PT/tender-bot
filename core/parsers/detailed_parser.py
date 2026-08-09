@@ -19,21 +19,7 @@ from loguru import logger
 
 from core.http_session import get_session_manager
 from core.document_processor import DocumentProcessor
-try:
-    try:
-        from core.tender_cache import TenderCache
-        HAS_TENDER_CACHE = True
-    except ModuleNotFoundError:
-        TenderCache = None
-        HAS_TENDER_CACHE = False
-        logger.debug("core.tender_cache не найден, кэширование отключено")
-
-    HAS_CACHE = True
-except ImportError:
-    TenderCache = None
-    PurchaseState = None
-    HAS_CACHE = False
-    logger.debug("core.tender_cache не найден, кэширование отключено")
+from core.tender_cache import TenderCache
 from core.tender_type import get_type_detector
 from core.parsers.html_parsers import Html44Parser, Html223Parser
 from core.parsers.address_parser import AddressParser
@@ -225,8 +211,8 @@ class DetailedParser:
         "needs_siz_norms", "needs_dsiz_norms", "needs_iot_norms",
     ]
 
-    def __init__(self, cache=None):
-        self.cache = cache if HAS_CACHE else None
+    def __init__(self, cache: Optional[TenderCache] = None):
+        self.cache = cache
         self.url_builder = get_url_builder()
         self.type_detector = get_type_detector()
         self.session_manager = get_session_manager(pool_size=1)
@@ -489,9 +475,10 @@ class DetailedParser:
         return ""
 
     def _save_to_cache(self, detail: TenderDetail):
-        if not self.cache or not HAS_CACHE:
+        if not self.cache:
             return
         try:
+            from core.tender_cache import PurchaseState
 
             state = PurchaseState(
                 reg_number=detail.reg_number,

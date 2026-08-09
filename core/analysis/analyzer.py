@@ -18,6 +18,42 @@ from core.risk_rules import RiskAnalyzer
 from core.tender_type import TenderTypeDetector
 from core.param_extractor import TenderParamExtractor
 from core.analysis.llm_wrapper import LlmWrapper
+from dataclasses import dataclass
+
+
+@dataclass
+class LLMResult:
+    tender_type: str = ""
+    confidence: float = 0.0
+    students_count: int = 0
+    rm_total: int = 0
+    points_count: int = 0
+    variant: int = 1
+    protocols_count: int = 0
+    certificates: int = 0
+    diplomas: int = 0
+    worker_certs: int = 0
+    qual_certs: int = 0
+    is_distance: bool = False
+    teacher_days: int = 0
+    accommodation_nights: int = 0
+    transport_km: int = 0
+    venue_rent_days: int = 0
+    manikin_days: int = 0
+    opr_positions: int = 0
+    opr_persons: int = 0
+    deadline_days: int = 0
+    addresses_count: int = 1
+    cities_count: int = 1
+    regions_count: int = 1
+    trip_days: int = 3
+    is_seasonal: bool = False
+    needs_siz_norms: bool = False
+    needs_dsiz_norms: bool = False
+    needs_iot_norms: bool = False
+    needs_subcontractor: bool = False
+    notes: str = ""
+
 
 @dataclass
 class AnalysisResult:
@@ -69,7 +105,23 @@ class TenderAnalyzer:
         logger.info(f"TextExtractor: confidence={extracted.confidence:.2f}")
 
         # === LLM: классификация и извлечение ===
-        llm_result = self.llm.analyze(tender_text, extracted)
+        llm_raw = self.llm.analyze_tender(
+            tender_text=tender_text,
+            tender_info=tender_info,
+            extracted_params=extracted,
+            classification=None,
+        )
+
+        # Конвертируем dict → LLMResult (dataclass)
+        if llm_raw is None:
+            llm_result = LLMResult()
+            logger.warning("LLM вернул None, используем пустой результат")
+        else:
+            # Берём только поля, которые есть в LLMResult
+            llm_fields = {f.name for f in LLMResult.__dataclass_fields__.values()}
+            filtered = {k: v for k, v in llm_raw.items() if k in llm_fields}
+            llm_result = LLMResult(**filtered)
+
         logger.info(f"LLM confidence: {llm_result.confidence:.2f}")
 
         # === Определение типа тендера ===
@@ -139,10 +191,6 @@ class TenderAnalyzer:
         # Приоритет 2: LLM классификация
         if llm_result.tender_type:
             return llm_result.tender_type
-
-        # Приоритет 3: Извлечённый тип
-        if extracted.tender_type:
-            return extracted.tender_type
 
         return "unknown"
 
