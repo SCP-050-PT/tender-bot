@@ -1,491 +1,759 @@
 """
 core/parsers/detailed_parser.py
-Детальный парсинг карточки тендера (оркестрация).
-РЕФАКТОРИНГ (v6.6-r1):
-  - HTML-парсеры вынесены в html_parsers.py
-  - Парсинг адресов вынесен в address_parser.py
-  - Исправлен баг: КТРУ теперь проверяет РМ и слушателей независимо
-  - Параметры применяются через маппинг (не 40 строк ручного кода)
+Детальный парсинг карточки тендера (common-info + документы).
+
+ИСПРАВЛЕНО (v6.8):
+- Регион 223-ФЗ извлекается из "Местонахождения" заказчика
+- Каскадное определение типа: Объект закупки -> Документы -> LLM
+- Улучшенный парсинг lot-list для 223-ФЗ
+- Улучшенное извлечение noticeGuid для 223-ФЗ
 """
 
 import re
 import time
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass
 from datetime import datetime
 
 from bs4 import BeautifulSoup
 from loguru import logger
 
-from core.http_session import get_session_manager
-from core.document_processor import DocumentProcessor
-from core.tender_cache import TenderCache
-from core.tender_type import get_type_detector
-from core.parsers.html_parsers import Html44Parser, Html223Parser
-from core.parsers.address_parser import AddressParser
-from utils.url_builder import get_url_builder
+# v6.8: Словарь город -> регион для fallback
+CITY_TO_REGION = {
+    "москва": "Москва",
+    "санкт-петербург": "Санкт-Петербург",
+    "севастополь": "Севастополь",
+    "новосибирск": "Новосибирская обл",
+    "екатеринбург": "Свердловская обл",
+    "нижний новгород": "Нижегородская обл",
+    "казань": "Республика Татарстан",
+    "самара": "Самарская обл",
+    "омск": "Омская обл",
+    "челябинск": "Челябинская обл",
+    "ростов-на-дону": "Ростовская обл",
+    "уфа": "Республика Башкортостан",
+    "красноярск": "Красноярский край",
+    "пермь": "Пермский край",
+    "воронеж": "Воронежская обл",
+    "волгоград": "Волгоградская обл",
+    "краснодар": "Краснодарский край",
+    "саратов": "Саратовская обл",
+    "тюмень": "Тюменская обл",
+    "тольятти": "Самарская обл",
+    "ижевск": "Удмуртская Республика",
+    "барнаул": "Алтайский край",
+    "иркутск": "Иркутская обл",
+    "хабаровск": "Хабаровский край",
+    "ярославль": "Ярославская обл",
+    "владивосток": "Приморский край",
+    "томск": "Томская обл",
+    "оренбург": "Оренбургская обл",
+    "кемерово": "Кемеровская обл",
+    "новокузнецк": "Кемеровская обл",
+    "рязань": "Рязанская обл",
+    "набережные челны": "Республика Татарстан",
+    "астрахань": "Астраханская обл",
+    "пенза": "Пензенская обл",
+    "липецк": "Липецкая обл",
+    "тула": "Тульская обл",
+    "киров": "Кировская обл",
+    "чебоксары": "Чувашская Республика",
+    "калининград": "Калининградская обл",
+    "брянск": "Брянская обл",
+    "курск": "Курская обл",
+    "иваново": "Ивановская обл",
+    "магнитогорск": "Челябинская обл",
+    "тверь": "Тверская обл",
+    "ставрополь": "Ставропольский край",
+    "симферополь": "Республика Крым",
+    "белгород": "Белгородская обл",
+    "архангельск": "Архангельская обл",
+    "курган": "Курганская обл",
+    "сургут": "Ханты-Мансийский АО",
+    "орёл": "Орловская обл",
+    "чита": "Забайкальский край",
+    "мурманск": "Мурманская обл",
+    "смоленск": "Смоленская обл",
+    "тамбов": "Тамбовская обл",
+    "владимир": "Владимирская обл",
+    "петрозаводск": "Республика Карелия",
+    "нижневартовск": "Ханты-Мансийский АО",
+    "йошкар-ола": "Республика Марий Эл",
+    "саранск": "Республика Мордовия",
+    "новороссийск": "Краснодарский край",
+    "якутск": "Республика Саха (Якутия)",
+    "надым": "Ямало-Ненецкий АО",
+    "салехард": "Ямало-Ненецкий АО",
+    "новый уренгой": "Ямало-Ненецкий АО",
+    "калуга": "Калужская обл",
+    "сочи": "Краснодарский край",
+    "петропавловск-камчатский": "Камчатский край",
+    "сыктывкар": "Республика Коми",
+    "ухта": "Республика Коми",
+    "вологда": "Вологодская обл",
+    "северодвинск": "Архангельская обл",
+    "череповец": "Вологодская обл",
+    "орск": "Оренбургская обл",
+    "бузулук": "Оренбургская обл",
+    "абакан": "Республика Хакасия",
+    "майкоп": "Республика Адыгея",
+    "нальчик": "Кабардино-Балкарская Республика",
+    "владикавказ": "Республика Северная Осетия",
+    "грозный": "Чеченская Республика",
+    "махачкала": "Республика Дагестан",
+    "черкесск": "Карачаево-Черкесская Республика",
+    "элиста": "Республика Калмыкия",
+    "альметьевск": "Республика Татарстан",
+    "нижнекамск": "Республика Татарстан",
+    "зеленодольск": "Республика Татарстан",
+    "стерлитамак": "Республика Башкортостан",
+    "салават": "Республика Башкортостан",
+    "нефтеюганск": "Ханты-Мансийский АО",
+    "ноябрьск": "Ямало-Ненецкий АО",
+    "губкинский": "Ямало-Ненецкий АО",
+    "мирный": "Республика Саха (Якутия)",
+    "ленск": "Республика Саха (Якутия)",
+    "алдан": "Республика Саха (Якутия)",
+    "нижний бестях": "Республика Саха (Якутия)",
+    "покачи": "Ханты-Мансийский АО",
+    "лангепас": "Ханты-Мансийский АО",
+    "радужный": "Ханты-Мансийский АО",
+    "урай": "Ханты-Мансийский АО",
+    "когалым": "Ханты-Мансийский АО",
+    "тобольск": "Тюменская обл",
+    "ишим": "Тюменская обл",
+    "ялуторовск": "Тюменская обл",
+    "заводоуковск": "Тюменская обл",
+    "шадринск": "Курганская обл",
+    "катайск": "Курганская обл",
+    "далматово": "Курганская обл",
+    "куртамыш": "Курганская обл",
+    "петухово": "Курганская обл",
+    "щучье": "Курганская обл",
+    "макушино": "Курганская обл",
+    "варгаши": "Курганская обл",
+    "каргаполье": "Курганская обл",
+    "юргамыш": "Курганская обл",
+    "альменево": "Курганская обл",
+    "целинное": "Курганская обл",
+    "частоозерье": "Курганская обл",
+    "шумиха": "Курганская обл",
+    "шатрово": "Курганская обл",
+    "мишкино": "Курганская обл",
+    "глядянское": "Курганская обл",
+    "мокроусово": "Курганская обл",
+    "притобольный": "Курганская обл",
+    "сафакулево": "Курганская обл",
+}
+
+# v6.8: Ключевые слова для каскадного определения типа
+TYPE_KEYWORDS = {
+    "sout": [
+        "специальная оценка условий труда",
+        "соут",
+        "оценка условий труда",
+        "спецоценка",
+        "вредные производственные факторы",
+        "идентификация потенциально вредных",
+        "класс условий труда",
+        "классы условий труда",
+        "декларация соответствия условий труда",
+        "карта соут",
+        "карты соут",
+        "протоколы измерений",
+        "исследования факторов",
+        "измерение вредных факторов",
+        "замеры вредных факторов",
+    ],
+    "opr": [
+        "оценка профессиональных рисков",
+        "опр",
+        "профессиональный риск",
+        "проф. риск",
+        "профриск",
+        "проф.риск",
+        "декларация о соответствии условий труда",
+        "мероприятия по снижению рисков",
+        "карта оценки профессиональных рисков",
+        "методика оценки профессиональных рисков",
+        "идентификация опасностей",
+        "анализ рисков",
+    ],
+    "education": [
+        "обучение охране труда",
+        "обучение по охране труда",
+        "программа обучения",
+        "программа повышения квалификации",
+        "переподготовка",
+        "повышение квалификации",
+        "профессиональное обучение",
+        "дополнительное образование",
+        "слушатели",
+        "учебные часы",
+        "учебный план",
+        "протоколы обучения",
+        "удостоверение",
+        "инструктаж",
+        "стажировка",
+        "обучение рабочих",
+        "обучение по промышленной безопасности",
+        "обучение по пожарной безопасности",
+        "обучение по электробезопасности",
+        "обучение по газовой безопасности",
+        "обучение по высотным работам",
+    ],
+    "plk": [
+        "производственный контроль",
+        "плк",
+        "лабораторные исследования",
+        "лабораторный контроль",
+        "замеры шума",
+        "замеры вибрации",
+        "замеры микроклимата",
+        "замеры освещенности",
+        "замеры электромагнитных полей",
+        "анализ воздуха рабочей зоны",
+        "санитарно-гигиенические исследования",
+        "гигиеническая оценка",
+        "санитарно-эпидемиологическая",
+        "испытания факторов производственной среды",
+    ],
+}
+
+# v6.8: ОКПД2 -> тип
+OKPD2_TO_TYPE = {
+    "85.42": "education",
+    "71.20.11": "plk",
+    "71.20.19": "plk",
+    "71.20.11.190": "plk",
+}
+
+RUSSIAN_REGIONS = [
+    "Москва",
+    "Санкт-Петербург",
+    "Севастополь",
+    "Московская обл",
+    "Ленинградская обл",
+    "Новосибирская обл",
+    "Свердловская обл",
+    "Нижегородская обл",
+    "Самарская обл",
+    "Омская обл",
+    "Челябинская обл",
+    "Ростовская обл",
+    "Красноярский край",
+    "Пермский край",
+    "Воронежская обл",
+    "Волгоградская обл",
+    "Краснодарский край",
+    "Саратовская обл",
+    "Тюменская обл",
+    "Алтайский край",
+    "Иркутская обл",
+    "Хабаровский край",
+    "Приморский край",
+    "Астраханская обл",
+    "Белгородская обл",
+    "Брянская обл",
+    "Владимирская обл",
+    "Вологодская обл",
+    "Ивановская обл",
+    "Калининградская обл",
+    "Калужская обл",
+    "Кемеровская обл",
+    "Кировская обл",
+    "Костромская обл",
+    "Курганская обл",
+    "Курская обл",
+    "Липецкая обл",
+    "Магаданская обл",
+    "Мурманская обл",
+    "Новгородская обл",
+    "Оренбургская обл",
+    "Орловская обл",
+    "Пензенская обл",
+    "Псковская обл",
+    "Рязанская обл",
+    "Сахалинская обл",
+    "Смоленская обл",
+    "Тамбовская обл",
+    "Тверская обл",
+    "Томская обл",
+    "Тульская обл",
+    "Ульяновская обл",
+    "Ярославская обл",
+    "Архангельская обл",
+    "Республика Адыгея",
+    "Республика Алтай",
+    "Республика Башкортостан",
+    "Республика Бурятия",
+    "Республика Дагестан",
+    "Республика Ингушетия",
+    "Кабардино-Балкарская Республика",
+    "Республика Калмыкия",
+    "Карачаево-Черкесская Республика",
+    "Республика Карелия",
+    "Республика Коми",
+    "Республика Крым",
+    "Республика Марий Эл",
+    "Республика Мордовия",
+    "Республика Саха (Якутия)",
+    "Республика Северная Осетия",
+    "Республика Татарстан",
+    "Республика Тыва",
+    "Удмуртская Республика",
+    "Республика Хакасия",
+    "Чеченская Республика",
+    "Чувашская Республика",
+    "Еврейская АО",
+    "Ненецкий АО",
+    "Ханты-Мансийский АО",
+    "Чукотский АО",
+    "Ямало-Ненецкий АО",
+    "Забайкальский край",
+    "Камчатский край",
+    "Ставропольский край",
+]
 
 
 @dataclass
 class TenderDocument:
-    """Документ тендера (ТЗ, извещение, КД)."""
+    """Документ тендера."""
 
     name: str
-    url: str
-    file_type: str = ""
-    size: str = ""
-    date: str = ""
-    is_active: bool = True
-    file_url: str = ""
-
-    def to_dict(self) -> Dict:
-        return {
-            "name": self.name,
-            "url": self.url,
-            "file_type": self.file_type,
-            "size": self.size,
-            "date": self.date,
-            "is_active": self.is_active,
-            "file_url": self.file_url,
-        }
+    link: str
+    file_type: Optional[str] = None
+    size: Optional[int] = None
 
 
 @dataclass
 class TenderDetail:
     """Детальная информация о тендере."""
 
-    reg_number: str = ""
-    law_type: str = ""
-    purchase_name: str = ""
-    purchase_method: str = ""
-    nmck: float = 0.0
-    customer_name: str = ""
-    customer_inn: str = ""
-    customer_region: str = ""
-    customer_address: str = ""
-    delivery_address: str = ""
-    publish_date: str = ""
-    deadline_date: str = ""
-    current_revision_date: str = ""
-    platform_name: str = ""
-    platform_url: str = ""
-    requirements: str = ""
-    documents: List[TenderDocument] = field(default_factory=list)
-    documents_text: str = ""
-    common_info_url: str = ""
-    documents_url: str = ""
-    application_guarantee: str = ""
-    contract_guarantee: str = ""
-    guarantee_method: str = ""
-    contact_person: str = ""
-    contact_email: str = ""
-    contact_phone: str = ""
-
-    # Извлечённые параметры
-    rm_total: int = 0
-    rm_category_1: int = 0
-    rm_category_2: int = 0
-    rm_with_iii: int = 0
-    points_count: int = 0
-    students_count: int = 0
-    factors_count: int = 0
-    addresses_count: int = 0
-    cities_count: int = 0
-    regions_count: int = 1
-    trips: int = 1
-    deadline_days: int = 0
-    has_full_time: bool = False
-    has_polygon: bool = False
-    is_urgent: bool = False
-    needs_siz_norms: bool = False
-    needs_dsiz_norms: bool = False
-    needs_iot_norms: bool = False
-    needs_subcontractor: bool = False
-    tender_type: str = ""
-
-    # Очные параметры обучения
-    teacher_days: int = 0
-    accommodation_nights: int = 0
-    transport_km: int = 0
-    venue_rent_days: int = 0
-    manikin_days: int = 0
-
-    # Параметры командировок СОУТ
-    trip_days: int = 0
-
-    # ОПР и сезонность
-    opr_positions: int = 0
-    opr_persons: int = 0
-    is_seasonal: bool = False
-
-    # v6.6-r1: Метаданные источников данных
-    _param_sources: Dict[str, str] = field(default_factory=dict, repr=False)
-
-    def set_param_source(self, param: str, source: str):
-        """Запоминает источник параметра (ktru, xls, docx, regex, llm)."""
-        self._param_sources[param] = source
-
-    def get_param_source(self, param: str) -> str:
-        return self._param_sources.get(param, "unknown")
-
-    def to_dict(self) -> Dict:
-        return {
-            "reg_number": self.reg_number,
-            "law_type": self.law_type,
-            "purchase_name": self.purchase_name,
-            "purchase_method": self.purchase_method,
-            "nmck": self.nmck,
-            "customer_name": self.customer_name,
-            "customer_inn": self.customer_inn,
-            "customer_region": self.customer_region,
-            "customer_address": self.customer_address,
-            "delivery_address": self.delivery_address,
-            "publish_date": self.publish_date,
-            "deadline_date": self.deadline_date,
-            "current_revision_date": self.current_revision_date,
-            "platform_name": self.platform_name,
-            "platform_url": self.platform_url,
-            "requirements": self.requirements,
-            "documents": [d.to_dict() for d in self.documents],
-            "documents_text": (
-                self.documents_text[:500] + "..."
-                if len(self.documents_text) > 500
-                else self.documents_text
-            ),
-            "common_info_url": self.common_info_url,
-            "documents_url": self.documents_url,
-            "application_guarantee": self.application_guarantee,
-            "contract_guarantee": self.contract_guarantee,
-            "guarantee_method": self.guarantee_method,
-            "contact_person": self.contact_person,
-            "contact_email": self.contact_email,
-            "contact_phone": self.contact_phone,
-            "rm_total": self.rm_total,
-            "rm_category_1": self.rm_category_1,
-            "rm_category_2": self.rm_category_2,
-            "rm_with_iii": self.rm_with_iii,
-            "points_count": self.points_count,
-            "students_count": self.students_count,
-            "factors_count": self.factors_count,
-            "addresses_count": self.addresses_count,
-            "cities_count": self.cities_count,
-            "regions_count": self.regions_count,
-            "trips": self.trips,
-            "deadline_days": self.deadline_days,
-            "has_full_time": self.has_full_time,
-            "has_polygon": self.has_polygon,
-            "is_urgent": self.is_urgent,
-            "needs_siz_norms": self.needs_siz_norms,
-            "needs_dsiz_norms": self.needs_dsiz_norms,
-            "needs_iot_norms": self.needs_iot_norms,
-            "needs_subcontractor": self.needs_subcontractor,
-            "tender_type": self.tender_type,
-            "teacher_days": self.teacher_days,
-            "accommodation_nights": self.accommodation_nights,
-            "transport_km": self.transport_km,
-            "venue_rent_days": self.venue_rent_days,
-            "manikin_days": self.manikin_days,
-            "trip_days": self.trip_days,
-            "opr_positions": self.opr_positions,
-            "opr_persons": self.opr_persons,
-            "is_seasonal": self.is_seasonal,
-        }
+    tender_id: str
+    law: str
+    title: str
+    customer: str
+    region: str
+    etp: str
+    nmck: float
+    publish_date: str
+    deadline_date: str
+    requirements: str
+    warranty_required: bool
+    warranty_percent: float
+    documents: List[Dict[str, Any]]
+    raw_html: str = ""
+    notice_guid: Optional[str] = None
+    tender_type_hint: Optional[str] = None
+    lot_info: Optional[Dict] = None
+    customer_address: Optional[str] = None
+    type_detection_source: Optional[str] = None
 
 
 class DetailedParser:
-    """Детальный парсер карточки тендера. Поддерживает 44-ФЗ, 223-ФЗ."""
+    """Парсер детальной информации о тендере."""
 
-    BASE_URL = "https://zakupki.gov.ru"
-    REQUEST_DELAY = (1, 3)
+    def __init__(self):
+        logger.info("DetailedParser инициализирован (v6.8)")
 
-    # v6.6-r1: Маппинг полей TenderDetail -> полей извлеченных параметров
-    PARAM_FIELDS = [
-        "rm_total", "rm_category_1", "rm_category_2", "rm_with_iii",
-        "points_count", "students_count", "factors_count", "addresses_count",
-        "trip_days", "teacher_days", "accommodation_nights", "transport_km",
-        "venue_rent_days", "manikin_days", "opr_positions", "opr_persons",
-    ]
+    def parse(self, html: str, tender_id: str, law: str) -> Optional[TenderDetail]:
+        """Парсит детальную информацию."""
+        soup = BeautifulSoup(html, "html.parser")
 
-    BOOL_FIELDS = [
-        "has_full_time", "has_polygon", "is_urgent", "is_seasonal",
-        "needs_siz_norms", "needs_dsiz_norms", "needs_iot_norms",
-    ]
-
-    def __init__(self, cache: Optional[TenderCache] = None):
-        self.cache = cache
-        self.url_builder = get_url_builder()
-        self.type_detector = get_type_detector()
-        self.session_manager = get_session_manager(pool_size=1)
-        self.session = self.session_manager.get_primary_session()
-        self.doc_processor = DocumentProcessor(session=self.session)
-
-        # v6.6-r1: Специализированные парсеры
-        self.html_44 = Html44Parser()
-        self.html_223 = Html223Parser()
-        self.address_parser = AddressParser()
-
-        logger.info("DetailedParser инициализирован (v6.6-r1)")
-
-    def parse(
-        self,
-        reg_number: str,
-        law_type: str = "223",
-        notice_guid: str = "",
-        nmck: float = None,
-    ) -> Optional[TenderDetail]:
-        """Парсит детальную информацию о тендере."""
-        logger.info(f"🔍 Детальный парсинг: {reg_number} ({law_type}-ФЗ)")
-
-        detail = TenderDetail(
-            reg_number=reg_number,
-            law_type=law_type,
-            nmck=nmck or 0.0,
+        notice_guid = self._extract_notice_guid(soup, law)
+        lot_info = self._parse_lot_list_223(soup, law) if law == "223-FZ" else None
+        tender_type_hint, type_source = self._cascade_type_detection(
+            soup, law, lot_info
         )
 
-        # === Шаг 1: Common Info ===
-        common_info = self._fetch_common_info(reg_number, law_type, notice_guid)
-        if not common_info:
-            logger.warning(f"⚠️ Не удалось загрузить common-info для {reg_number}")
+        title = self._extract_title(soup)
+        customer = self._extract_customer(soup)
+        region = self._extract_region(soup, law, lot_info)
+        etp = self._extract_etp(soup)
+        nmck = self._extract_nmck(soup)
+        publish_date = self._extract_publish_date(soup)
+        deadline_date = self._extract_deadline(soup)
+        requirements = self._extract_requirements(soup)
+        warranty_info = self._extract_warranty(soup)
+        documents = self._extract_documents(soup)
+        customer_address = self._extract_customer_address(soup, law)
+
+        return TenderDetail(
+            tender_id=tender_id,
+            law=law,
+            title=title,
+            customer=customer,
+            region=region,
+            etp=etp,
+            nmck=nmck,
+            publish_date=publish_date,
+            deadline_date=deadline_date,
+            requirements=requirements,
+            warranty_required=warranty_info["required"],
+            warranty_percent=warranty_info["percent"],
+            documents=documents,
+            raw_html=html,
+            notice_guid=notice_guid,
+            tender_type_hint=tender_type_hint,
+            lot_info=lot_info,
+            customer_address=customer_address,
+            type_detection_source=type_source,
+        )
+
+    # ==================== v6.8: НОВЫЕ МЕТОДЫ ====================
+
+    def _extract_notice_guid(self, soup: BeautifulSoup, law: str) -> Optional[str]:
+        """Извлекает noticeGuid из HTML для 223-ФЗ."""
+        if law != "223-FZ":
             return None
 
-        detail.common_info_url = common_info["url"]
-        soup = BeautifulSoup(common_info["html"], "html.parser")
+        patterns = [
+            r'noticeGuid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
+            r'purchaseNoticeGuid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
+            r'guid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
+        ]
 
-        # Fallback noticeGuid для 223-ФЗ
-        if law_type == "223" and not notice_guid:
-            notice_guid = self._extract_notice_guid_from_html(common_info["html"])
+        html_text = str(soup)
+        for pattern in patterns:
+            match = re.search(pattern, html_text)
+            if match:
+                guid = match.group(1)
+                logger.info(f"    [noticeGuid] Извлечен из HTML: {guid}")
+                return guid
 
-        # Парсим common-info через специализированный парсер
-        if law_type == "44":
-            parsed_info = self.html_44.parse_common_info(soup)
-        else:
-            parsed_info = self.html_223.parse_common_info(soup)
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            match = re.search(r"noticeGuid=([0-9a-fA-F\-]{36})", href)
+            if match:
+                guid = match.group(1)
+                logger.info(f"    [noticeGuid] Извлечен из ссылки: {guid}")
+                return guid
 
-        for key, value in parsed_info.items():
-            if hasattr(detail, key) and value is not None:
-                setattr(detail, key, value)
+        logger.warning("    [noticeGuid] Не найден в HTML 223-ФЗ")
+        return None
 
-        if not detail.nmck and parsed_info.get("nmck"):
-            detail.nmck = parsed_info["nmck"]
+    def _parse_lot_list_223(self, soup: BeautifulSoup, law: str) -> Optional[Dict]:
+        """Парсит lot-list для 223-ФЗ: объект закупки, ОКПД2, ОКВЭД2."""
+        if law != "223-FZ":
+            return None
 
-        # v6.6-r1: Парсим КТРУ из HTML 44-ФЗ (НЕЗАВИСИМО для РМ и слушателей)
-        if law_type == "44":
-            ktru_data = self.html_44.parse_ktru_positions(soup)
-
-            # РМ и слушатели — независимые проверки (был баг с elif)
-            if ktru_data.get("rm_total"):
-                detail.rm_total = ktru_data["rm_total"]
-                detail.set_param_source("rm_total", "ktru")
-                if not detail.tender_type:
-                    detail.tender_type = "sout"
-                logger.info(f"   [KTRU] rm_total={detail.rm_total} (confidence=1.0)")
-
-            if ktru_data.get("students_count"):
-                detail.students_count = ktru_data["students_count"]
-                detail.set_param_source("students_count", "ktru")
-                if not detail.tender_type:
-                    detail.tender_type = "education"
-                logger.info(f"   [KTRU] students_count={detail.students_count} (confidence=1.0)")
-
-        self._log_common_info(detail)
-
-        # === Шаг 2: Документы ===
-        docs_info = self._fetch_documents(reg_number, law_type, notice_guid)
-        if docs_info:
-            detail.documents_url = docs_info["url"]
-            docs_soup = BeautifulSoup(docs_info["html"], "html.parser")
-            if law_type == "44":
-                detail.documents = self.html_44.parse_documents(docs_soup)
-            else:
-                detail.documents = self.html_223.parse_documents(docs_soup)
-
-            logger.info(f"   📄 Документов: {len(detail.documents)}")
-            active_docs = [d for d in detail.documents if d.is_active]
-            logger.info(f"   📄 Активных документов: {len(active_docs)}")
-
-            if detail.documents:
-                detail.documents_text = self.doc_processor.process_documents(
-                    detail.documents, max_docs=3
-                )
-                logger.info(
-                    f"   📝 Текст документов: {len(detail.documents_text)} символов"
-                )
-
-        # === Шаг 3: Извлечение параметров из текста ===
-        full_text = (
-            f"{detail.purchase_name} {detail.requirements} {detail.documents_text}"
-        )
-        self._extract_params_from_text(detail, full_text)
-
-        # === Шаг 4: Пересчет адресов ===
-        delivery_for_count = detail.delivery_address or detail.customer_address
-        if delivery_for_count:
-            address_result = self.address_parser.count_addresses(
-                delivery_for_count, detail.tender_type
-            )
-            detail.cities_count = address_result.get("cities_count", 0)
-            detail.regions_count = max(1, address_result.get("regions_count", 1))
-            detail.trips = max(1, address_result.get("trips", 1))
-
-            # Считаем адреса
-            delivery_clean = (
-                delivery_for_count.replace("<br>", "\n")
-                .replace("<br/>", "\n")
-                .replace("<br />", "\n")
-            )
-            if "\n" in delivery_clean:
-                lines = [
-                    l.strip()
-                    for l in delivery_clean.split("\n")
-                    if l.strip() and len(l.strip()) > 5
-                ]
-                detail.addresses_count = len(lines)
-            else:
-                city_markers = re.findall(
-                    r"г\.\s*\w+|город\s+\w+", delivery_clean, re.IGNORECASE
-                )
-                detail.addresses_count = max(1, len(city_markers))
-
-            if address_result.get("needs_manual_check"):
-                logger.warning(
-                    f"   [AddressParser] ⚠️ Много адресов/регионов — требуется ручная проверка"
-                )
-
-        # === Шаг 5: Кэширование ===
-        if self.cache:
-            self._save_to_cache(detail)
-
-        return detail
-
-    def _extract_params_from_text(self, detail: TenderDetail, text: str):
-        """v6.6-r1: Использует TenderParamExtractor + маппинг полей."""
-        if not text or len(text) < 50:
-            return
-
-        from core.param_extractor import TenderParamExtractor
-
-        extractor = TenderParamExtractor()
-        params = extractor.extract(text, nmck=detail.nmck, tender_type_hint=detail.tender_type)
-
-        # Сохраняем КТРУ-данные перед применением regex/LLM
-        ktru_values = {
-            "rm_total": detail.rm_total,
-            "students_count": detail.students_count,
+        lot_info = {
+            "object_name": "",
+            "okpd2": [],
+            "okved2": [],
+            "nmck": 0.0,
         }
 
-        # v6.6-r1: Применяем числовые параметры через маппинг
-        for field in self.PARAM_FIELDS:
-            value = getattr(params, field, None)
-            if value is not None:
-                current = getattr(detail, field, 0)
-                # Не перезаписываем КТРУ-данные (confidence=1.0)
-                if field in ktru_values and ktru_values[field] > 0:
-                    if current != ktru_values[field]:
-                        logger.info(
-                            f"   [Priority] КТРУ {field}={ktru_values[field]} "
-                            f"(вместо {value} из текста)"
-                        )
-                    continue
-                setattr(detail, field, value)
-                detail.set_param_source(field, "regex")
+        tables = soup.find_all("table", class_="table")
+        for table in tables:
+            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
+            if any(
+                "окпд2" in h or "оквэд2" in h or "наименование лота" in h
+                for h in headers
+            ):
+                rows = table.find_all("tr")
+                for row in rows[1:]:
+                    cells = row.find_all("td")
+                    if len(cells) >= 3:
+                        obj_text = cells[0].get_text(separator=" ", strip=True)
+                        if not obj_text:
+                            obj_text = cells[1].get_text(separator=" ", strip=True)
+                        lot_info["object_name"] = obj_text
 
-        # v6.6-r1: Применяем булевы флаги
-        for field in self.BOOL_FIELDS:
-            value = getattr(params, field, None)
-            if value is not None:
-                setattr(detail, field, value)
+                        for cell in cells:
+                            text = cell.get_text(strip=True)
+                            okpd_match = re.search(
+                                r"(\d{2}\.\d{2}\.\d{2}(?:\.\d+)?)", text
+                            )
+                            if okpd_match:
+                                lot_info["okpd2"].append(okpd_match.group(1))
+                            okved_match = re.search(r"(\d{2}\.\d{2}(?:\.\d+)?)", text)
+                            if (
+                                okved_match
+                                and okved_match.group(1) not in lot_info["okpd2"]
+                            ):
+                                lot_info["okved2"].append(okved_match.group(1))
 
-        # Тип тендера (если не определен через КТРУ)
-        if not detail.tender_type and params.region_hint:
-            type_result = self.type_detector.detect(text)
-            detail.tender_type = type_result.tender_type
-
-        logger.info(
-            f"   📊 Извлечено: РМ={detail.rm_total}, кат.1={detail.rm_category_1}, "
-            f"кат.2={detail.rm_category_2}, ИИИ={detail.rm_with_iii}, "
-            f"точек={detail.points_count}, слушателей={detail.students_count}, "
-            f"тип={detail.tender_type}, городов={detail.cities_count}, "
-            f"адресов={detail.addresses_count}, дней_выезда={detail.trip_days}, "
-            f"сезон={detail.is_seasonal}, opr_pos={detail.opr_positions}, opr_per={detail.opr_persons}"
-        )
-
-    def _log_common_info(self, detail: TenderDetail):
-        """Логирует результаты парсинга common-info."""
-        logger.info(
-            f"   ✅ Common-info: {detail.purchase_name[:60] if detail.purchase_name else 'N/A'}..."
-        )
-        logger.info(f"   📍 Регион: {detail.customer_region or 'не определен'}")
-        logger.info(f"   🏢 ЭТП: {detail.platform_name or 'не определена'}")
-        logger.info(f"   📋 Требования: {'есть' if detail.requirements else 'нет'}")
-        logger.info(f"   🔒 Обеспечение заявки (raw): '{detail.application_guarantee or 'пусто'}'")
-        logger.info(f"   🔒 Обеспечение контракта (raw): '{detail.contract_guarantee or 'пусто'}'")
-        logger.info(f"   🔒 Способ обеспечения (raw): '{detail.guarantee_method or 'пусто'}'")
-
-    # ============ FETCH METHODS ============
-
-    def _fetch_common_info(
-        self, reg_number: str, law_type: str, notice_guid: str = ""
-    ) -> Optional[Dict[str, str]]:
-        url = self.url_builder.build_common_info_url(reg_number, law_type, notice_guid)
-        return self._fetch_page(url)
-
-    def _fetch_documents(
-        self, reg_number: str, law_type: str, notice_guid: str = ""
-    ) -> Optional[Dict[str, str]]:
-        url = self.url_builder.build_documents_url(reg_number, law_type, notice_guid)
-        return self._fetch_page(url)
-
-    def _fetch_page(self, url: str, retries: int = 3) -> Optional[Dict[str, str]]:
-        """Использует единую сессию из http_session."""
-        import random
-
-        time.sleep(random.uniform(*self.REQUEST_DELAY))
-
-        for attempt in range(retries):
-            try:
-                response = self.session.get(url, timeout=30)
-                if response.status_code == 200:
-                    return {"url": url, "html": response.text}
-                elif response.status_code == 429:
-                    logger.warning(f"   ⏳ 429, ждем...")
-                    time.sleep(5 * (attempt + 1))
-                else:
-                    logger.warning(f"   ⚠️ Статус {response.status_code}")
-            except Exception as e:
-                logger.error(f"   ❌ Ошибка загрузки: {e}")
-                time.sleep(2)
+                logger.info(
+                    f"    [LotList223] Объект: {lot_info['object_name'][:80]}..."
+                )
+                logger.info(f"    [LotList223] ОКПД2: {lot_info['okpd2']}")
+                return lot_info
 
         return None
 
-    def _extract_notice_guid_from_html(self, html: str) -> str:
-        """Извлекает noticeGuid из HTML страницы 223-ФЗ."""
-        if not html:
+    def _cascade_type_detection(
+        self, soup: BeautifulSoup, law: str, lot_info: Optional[Dict]
+    ) -> tuple:
+        """Каскадное определение типа тендера. Возвращает (type_hint, source)."""
+        text_sources = []
+
+        if lot_info and lot_info.get("object_name"):
+            text_sources.append((lot_info["object_name"], "lot_object"))
+
+        if lot_info and lot_info.get("okpd2"):
+            for okpd in lot_info["okpd2"]:
+                for pattern, ttype in OKPD2_TO_TYPE.items():
+                    if okpd.startswith(pattern):
+                        logger.info(f"    [TypeDetect] ОКПД2 {okpd} -> {ttype}")
+                        return ttype, "okpd2"
+
+        title = self._extract_title(soup)
+        if title:
+            text_sources.append((title, "title"))
+
+        obj_block = soup.find("div", class_="registry-entry__body-block")
+        if obj_block:
+            obj_title = obj_block.find("div", class_="registry-entry__body-title")
+            if obj_title and "объект" in obj_title.get_text().lower():
+                obj_value = obj_block.find("div", class_="registry-entry__body-value")
+                if obj_value:
+                    text_sources.append(
+                        (obj_value.get_text(strip=True), "common_info_object")
+                    )
+
+        for text, source in text_sources:
+            text_lower = text.lower()
+            for ttype, keywords in TYPE_KEYWORDS.items():
+                for keyword in keywords:
+                    if keyword.lower() in text_lower:
+                        logger.info(
+                            f"    [TypeDetect] Ключевое слово '{keyword}' в {source} -> {ttype}"
+                        )
+                        return ttype, f"keyword:{source}"
+
+        return None, "undetermined"
+
+    def _extract_customer_address(self, soup: BeautifulSoup, law: str) -> Optional[str]:
+        """Извлекает адрес заказчика из common-info (для 223-ФЗ)."""
+        if law != "223-FZ":
+            return None
+
+        sections = soup.find_all("section", class_="common-text")
+        for section in sections:
+            caption = section.find("div", class_="common-text__caption")
+            if caption and "заказчик" in caption.get_text().lower():
+                rows = section.find_all("div", class_="row")
+                for row in rows:
+                    text = row.get_text(separator=" ", strip=True)
+                    if "местонахождение" in text.lower() or "адрес" in text.lower():
+                        address_match = re.search(
+                            r"(?:местонахождение|адрес)[\s:]*(.+?)(?:\n|$)",
+                            text,
+                            re.IGNORECASE,
+                        )
+                        if address_match:
+                            address = address_match.group(1).strip()
+                            logger.info(f"    [CustomerAddress] {address[:80]}...")
+                            return address
+
+        return None
+
+    def _extract_region_from_address(self, address: str) -> str:
+        """Извлекает регион из адресной строки."""
+        if not address:
             return ""
-        patterns = [
-            r"noticeGuid=([a-f0-9\-]+)",
-            r'"noticeGuid"\s*:\s*"([a-f0-9\-]+)"',
-            r"noticeGuid\s*=\s*'([a-f0-9\-]+)'",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, html, re.IGNORECASE)
-            if match:
-                guid = match.group(1)
-                logger.info(f"   [noticeGuid] Извлечен из HTML: {guid}")
-                return guid
+
+        address_lower = address.lower()
+
+        for region in RUSSIAN_REGIONS:
+            if region.lower() in address_lower:
+                return region
+
+        city_match = re.search(r"г\.?\s*([А-Яа-я\-]+)", address, re.IGNORECASE)
+        if city_match:
+            city = city_match.group(1).lower()
+            if city in CITY_TO_REGION:
+                return CITY_TO_REGION[city]
+
+        parts = [p.strip() for p in address.split(",")]
+        for part in parts:
+            part_lower = part.lower()
+            for region in RUSSIAN_REGIONS:
+                if region.lower() in part_lower:
+                    return region
+            if "янао" in part_lower or "ямало-ненец" in part_lower:
+                return "Ямало-Ненецкий АО"
+            if "хмао" in part_lower or "ханты-манс" in part_lower:
+                return "Ханты-Мансийский АО"
+            if "чукот" in part_lower:
+                return "Чукотский АО"
+            if "ненец" in part_lower and "ямал" not in part_lower:
+                return "Ненецкий АО"
+
         return ""
 
-    def _save_to_cache(self, detail: TenderDetail):
-        if not self.cache:
-            return
-        try:
-            from core.tender_cache import PurchaseState
+    # ==================== СУЩЕСТВУЮЩИЕ МЕТОДЫ ====================
 
-            state = PurchaseState(
-                reg_number=detail.reg_number,
-                last_update_date=detail.current_revision_date or detail.publish_date or "",
-                status="parsed",
-                checked_at=datetime.now().isoformat(),
-            )
-            self.cache.set_purchase_state(state)
-        except Exception as e:
-            logger.debug(f"Ошибка сохранения в кэш: {e}")
+    def _extract_region(
+        self, soup: BeautifulSoup, law: str, lot_info: Optional[Dict]
+    ) -> str:
+        """Извлекает регион с учётом типа закона."""
+        if law == "223-FZ":
+            customer_address = self._extract_customer_address(soup, law)
+            if customer_address:
+                region = self._extract_region_from_address(customer_address)
+                if region:
+                    logger.info(
+                        f"    [Region223] Извлечен из адреса заказчика: {region}"
+                    )
+                    return region
+
+            if lot_info and lot_info.get("object_name"):
+                region = self._extract_region_from_address(lot_info["object_name"])
+                if region:
+                    logger.info(
+                        f"    [Region223] Извлечен из объекта закупки: {region}"
+                    )
+                    return region
+
+        region_elem = soup.find("span", string=re.compile("Регион", re.I))
+        if region_elem:
+            parent = region_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    return value.get_text(strip=True)
+
+        text = soup.get_text()
+        region_patterns = [
+            r"Регион\s*[:\-]\s*([^\n]+)",
+            r"Место нахождения[^\n]*\n([^\n]+)",
+        ]
+        for pattern in region_patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+
+        return ""
+
+    def _extract_title(self, soup: BeautifulSoup) -> str:
+        """Извлекает название тендера."""
+        title_elem = soup.find("span", class_="cardMainInfo__purchaseLink")
+        if title_elem:
+            return title_elem.get_text(strip=True)
+
+        obj_block = soup.find("div", class_="registry-entry__body-block")
+        if obj_block:
+            title_elem = obj_block.find("div", class_="registry-entry__body-title")
+            if title_elem and "объект" in title_elem.get_text().lower():
+                obj_value = obj_block.find("div", class_="registry-entry__body-value")
+                if obj_value:
+                    return obj_value.get_text(strip=True)
+
+        return ""
+
+    def _extract_customer(self, soup: BeautifulSoup) -> str:
+        """Извлекает заказчика."""
+        customer_elem = soup.find("span", string=re.compile("Заказчик", re.I))
+        if customer_elem:
+            parent = customer_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    return value.get_text(strip=True)
+
+        customer_block = soup.find("div", class_="registry-entry__body-block")
+        if customer_block:
+            title = customer_block.find("div", class_="registry-entry__body-title")
+            if title and "заказчик" in title.get_text().lower():
+                value = customer_block.find("div", class_="registry-entry__body-value")
+                if value:
+                    return value.get_text(strip=True)
+
+        return ""
+
+    def _extract_etp(self, soup: BeautifulSoup) -> str:
+        """Извлекает ЭТП."""
+        etp_elem = soup.find("span", string=re.compile("Электронная площадка", re.I))
+        if etp_elem:
+            parent = etp_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    return value.get_text(strip=True)
+        return ""
+
+    def _extract_nmck(self, soup: BeautifulSoup) -> float:
+        """Извлекает НМЦК."""
+        nmck_elem = soup.find("span", class_="cardMainInfo__content_cost")
+        if nmck_elem:
+            text = nmck_elem.get_text(strip=True)
+            cleaned = re.sub(r"[^\d.,]", "", text)
+            cleaned = cleaned.replace(",", ".")
+            try:
+                return float(cleaned)
+            except ValueError:
+                return 0.0
+        return 0.0
+
+    def _extract_publish_date(self, soup: BeautifulSoup) -> str:
+        """Извлекает дату публикации."""
+        date_elem = soup.find("span", string=re.compile("Размещено", re.I))
+        if date_elem:
+            parent = date_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    return value.get_text(strip=True)
+        return ""
+
+    def _extract_deadline(self, soup: BeautifulSoup) -> str:
+        """Извлекает дедлайн."""
+        deadline_elem = soup.find(
+            "span", string=re.compile("Окончание подачи заявок", re.I)
+        )
+        if deadline_elem:
+            parent = deadline_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    return value.get_text(strip=True)
+        return ""
+
+    def _extract_requirements(self, soup: BeautifulSoup) -> str:
+        """Извлекает требования."""
+        req_elem = soup.find("span", string=re.compile("Требования", re.I))
+        if req_elem:
+            parent = req_elem.find_parent("div", class_="col-12")
+            if parent:
+                value = parent.find("div", class_="")
+                if value:
+                    return value.get_text(strip=True)
+        return ""
+
+    def _extract_warranty(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """Извлекает информацию об обеспечении."""
+        warranty = {"required": False, "percent": 0.0}
+
+        warranty_elem = soup.find("span", string=re.compile("Обеспечение заявки", re.I))
+        if warranty_elem:
+            parent = warranty_elem.find_parent("div", class_="col-6")
+            if parent:
+                value = parent.find("span", class_="section__info")
+                if value:
+                    text = value.get_text(strip=True).lower()
+                    if "требуется" in text or "да" in text:
+                        warranty["required"] = True
+                        percent_match = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
+                        if percent_match:
+                            warranty["percent"] = float(percent_match.group(1))
+
+        return warranty
+
+    def _extract_documents(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
+        """Извлекает список документов."""
+        documents = []
+        doc_tables = soup.find_all("table", class_="table")
+        for table in doc_tables:
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all("td")
+                if len(cells) >= 2:
+                    name = cells[0].get_text(strip=True)
+                    link_elem = cells[0].find("a", href=True)
+                    link = link_elem.get("href") if link_elem else ""
+                    if name and link:
+                        documents.append({"name": name, "link": link})
+        return documents

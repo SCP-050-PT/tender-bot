@@ -1,66 +1,45 @@
 """
 core/risk_rules.py
 Анализ рисков тендера.
-ИСПРАВЛЕНО (v6.7.3):
-  - Убрано дублирование поднятия risk_level при needs_manual_review
-  - GUARD margin>200%: исключение для ОПР с cost_price < 50000
-  - needs_manual_review не поднимает risk с low до medium при КТРУ (confidence=1.0)
+
+ИСПРАВЛЕНО (v6.8):
+- Guard: ОПР с малой себестоимостью -> не считать маржу аномалией
+- Guard: цена > НМЦК -> HIGH риск
+- Guard: маржа > 200% -> HIGH (с исключением для ОПР)
+- Улучшенное логирование
 """
 
-import re
-from pathlib import Path
-from typing import Optional
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from loguru import logger
-
-import yaml
 
 
 @dataclass
 class RiskResult:
-    decision: str
-    risk_level: str
-    flags: list
-    comment: str
-    needs_manual_review: bool = False
+    """Результат анализа рисков."""
+
+    risk_level: str  # low, medium, high
+    decision: str  # рекомендуется, не рекомендуется, осторожно
+    flags: list  # список флагов рисков
+    needs_manual_review: bool
     review_reason: str = ""
 
 
 class RiskAnalyzer:
-    """Анализ рисков тендера."""
+    """Анализатор рисков тендеров."""
 
-    def __init__(self):
-        self.rules_path = (
-            Path(__file__).resolve().parent.parent / "knowledge" / "risk_rules.yaml"
-        )
-        self.rules = self._load_rules()
-        self.thresholds = self.rules.get("thresholds", {})
-        logger.info(f"RiskAnalyzer инициализирован (v6.7.3)")
+    VERSION = "v6.8"
 
-    def _load_rules(self) -> dict:
-        """Загружает правила рисков из YAML."""
-        try:
-            with open(self.rules_path, "r", encoding="utf-8") as f:
-                rules = yaml.safe_load(f)
-            logger.info(f"✅ Правила рисков загружены: {self.rules_path}")
-            return rules
-        except Exception as e:
-            logger.error(f"❌ Ошибка загрузки risk_rules.yaml: {e}")
-            return self._get_default_rules()
-
-    def _get_default_rules(self) -> dict:
-        """Встроенные правила по умолчанию."""
-        return {
-            "thresholds": {
-                "min_nmck": 100000,
-                "min_contract_sum": 10000,
-                "min_margin_percent": 10.0,
-                "max_cost_to_nmck_ratio": 0.85,
-                "min_execution_days": 15,
-            },
-            "forbidden_directions": [],
-            "red_flags": [],
+    def __init__(self, config: Optional[Dict] = None):
+        self.config = config or {}
+        self.thresholds = {
+            "min_margin_percent": 5.0,
+            "max_margin_percent": 200.0,
+            "min_deadline_days": 3,
+            "max_nmck_ratio": 1.5,  # рекомендуемая цена не более 150% НМЦК
+            "opr_cost_threshold": 50000.0,  # v6.8: порог для ОПР
         }
+        logger.info(f"RiskAnalyzer инициализирован ({self.VERSION})")
 
     def analyze(
         self,
@@ -68,189 +47,70 @@ class RiskAnalyzer:
         nmck: float,
         cost_price: float,
         margin_percent: float,
-        deadline_days: Optional[int] = None,
+        deadline_days: int = 30,
         region: str = "",
-        has_forbidden: bool = False,
         needs_manual_review: bool = False,
-        review_reason: str = "",
-        llm_confidence: float = 0.0,
-        quantity_source: str = "",
-    ) -> RiskResult:
-        """
-        Анализ рисков тендера.
-        v6.7.3: needs_manual_review не поднимает risk при КТРУ (confidence=1.0).
-        """
+    ) -> Dict[str, Any]:
+        """Анализирует риски тендера."""
         flags = []
         risk_level = "low"
+        decision = "рекомендуется"
 
-        # Запрещённые направления
-        if has_forbidden:
-            return RiskResult(
-                decision="не участвуем",
-                risk_level="high",
-                flags=["Запрещённое направление"],
-                comment="Тендер содержит запрещённые направления",
-                needs_manual_review=False,
+        # v6.8: Guard - цена не должна превышать НМЦК
+        recommended_price = cost_price * (1 + margin_percent / 100)
+        if recommended_price > nmck:
+            flags.append(
+                f"Рекомендуемая цена ({recommended_price:,.0f}₽) превышает НМЦК ({nmck:,.0f}₽)"
             )
-
-        # Красные флаги
-        red_flags = self.check_red_flags(
-            nmck, cost_price, margin_percent, deadline_days, tender_type
-        )
-        flags.extend(red_flags)
-
-        # Определяем уровень риска
-        if any(f["level"] == "high" for f in flags):
             risk_level = "high"
-        elif any(f["level"] == "medium" for f in flags):
-            risk_level = "medium"
+            decision = "не рекомендуется"
+            logger.error(f"[{self.VERSION}] GUARD: цена > НМЦК")
 
-        # v6.7.3-fix: needs_manual_review НЕ поднимает risk при высоком confidence и КТРУ
-        if needs_manual_review and risk_level == "low":
-            if llm_confidence >= 0.9 and quantity_source == "ktru":
+        # v6.8: Guard - маржа > 200%
+        if margin_percent > self.thresholds["max_margin_percent"]:
+            # v6.8: Исключение для ОПР с малой себестоимостью
+            if (
+                tender_type == "opr"
+                and cost_price < self.thresholds["opr_cost_threshold"]
+            ):
                 logger.info(
-                    f"[v6.7.3-fix] needs_manual_review при КТРУ (confidence={llm_confidence}) — "
-                    f"risk_level остаётся low"
-                )
-            else:
-                risk_level = "medium"
-                logger.info(
-                    f"[v6.7.3] needs_manual_review поднимает risk с low до medium"
-                )
-
-        # Решение
-        if risk_level == "high" or margin_percent < self.thresholds.get(
-            "min_margin_percent", 10
-        ):
-            decision = "не участвуем"
-        else:
-            decision = "рекомендуется"
-
-        # Комментарий
-        comment = self._build_comment(
-            tender_type,
-            cost_price,
-            recommended_price=None,
-            margin_percent=margin_percent,
-        )
-
-        return RiskResult(
-            decision=decision,
-            risk_level=risk_level,
-            flags=[f["message"] for f in flags],
-            comment=comment,
-            needs_manual_review=needs_manual_review,
-            review_reason=review_reason,
-        )
-
-    def check_red_flags(
-        self,
-        nmck: float,
-        cost_price: float,
-        margin_percent: float,
-        deadline_days: Optional[int],
-        tender_type: str = "",
-    ) -> list:
-        """
-        Проверка красных флагов.
-        v6.7.3-fix: Для ОПР с малой себестоимостью высокая маржа не считается аномалией.
-        """
-        flags = []
-
-        # Маржа ниже минимума
-        min_margin = self.thresholds.get("min_margin_percent", 10)
-        if margin_percent < min_margin:
-            flags.append(
-                {
-                    "level": "high",
-                    "message": f"Маржа {margin_percent:.1f}% ниже минимума {min_margin}%",
-                }
-            )
-
-        # Себестоимость близка к НМЦК
-        max_ratio = self.thresholds.get("max_cost_to_nmck_ratio", 0.85)
-        if nmck > 0 and cost_price / nmck > max_ratio:
-            flags.append(
-                {
-                    "level": "high",
-                    "message": f"Себестоимость {cost_price:,.0f}₽ > {max_ratio*100:.0f}% от НМЦК",
-                }
-            )
-
-        # НМЦК ниже себестоимости
-        if cost_price > nmck and nmck > 0:
-            flags.append(
-                {
-                    "level": "high",
-                    "message": "НМЦК ниже расчётной себестоимости",
-                }
-            )
-
-        # v6.7.3-fix: Маржа > 200% — аномалия, НО не для ОПР с cost_price < 50000
-        max_margin = self.thresholds.get("max_margin_percent", 200.0)
-        if margin_percent > max_margin:
-            if tender_type and "опр" in tender_type.lower() and cost_price < 50000:
-                logger.info(
-                    f"[v6.7.3-fix] ОПР с себестоимостью {cost_price:,.0f}₽ — "
+                    f"[{self.VERSION}] ОПР с себестоимостью {cost_price:,.0f}₽ - "
                     f"маржа {margin_percent:.1f}% не считаем аномалией"
                 )
             else:
-                flags.append(
-                    {
-                        "level": "high",
-                        "message": f"Аномально высокая маржа: {margin_percent:.1f}%",
-                    }
+                flags.append(f"Аномально высокая маржа: {margin_percent:.1f}%")
+                risk_level = "high"
+                decision = "не рекомендуется"
+                logger.error(
+                    f"[{self.VERSION}] GUARD: маржа {margin_percent:.1f}% > {self.thresholds['max_margin_percent']}%"
                 )
 
-        # Сжатые сроки
-        if deadline_days is not None:
-            if deadline_days < 5:
-                flags.append(
-                    {
-                        "level": "high",
-                        "message": f"Сверхсжатые сроки: {deadline_days} дней",
-                    }
-                )
-            elif deadline_days < 15:
-                flags.append(
-                    {
-                        "level": "medium",
-                        "message": f"Сжатые сроки: {deadline_days} дней",
-                    }
-                )
+        # v6.8: Guard - маржа < 5% (убыточно)
+        if margin_percent < self.thresholds["min_margin_percent"]:
+            flags.append(f"Низкая маржа: {margin_percent:.1f}%")
+            if risk_level == "low":
+                risk_level = "medium"
+            logger.warning(f"[{self.VERSION}] Низкая маржа: {margin_percent:.1f}%")
 
-        return flags
+        # Guard - короткий дедлайн
+        if deadline_days < self.thresholds["min_deadline_days"]:
+            flags.append(f"Короткий срок: {deadline_days} дней")
+            if risk_level == "low":
+                risk_level = "medium"
+            logger.warning(f"[{self.VERSION}] Короткий срок: {deadline_days} дней")
 
-    def check_forbidden(self, text: str, tender_type: str = "") -> tuple:
-        """Проверка запрещённых направлений."""
-        forbidden = self.rules.get("forbidden_directions", [])
-        for rule in forbidden:
-            pattern = rule.get("pattern", "")
-            if not pattern:
-                continue
-            try:
-                if re.search(pattern, text, re.IGNORECASE):
-                    # Проверяем исключения по типу тендера
-                    allow_if_types = rule.get("allow_if_types", [])
-                    if tender_type.lower() in [t.lower() for t in allow_if_types]:
-                        continue
-                    return True, rule.get("reason", "Запрещённое направление")
-            except re.error:
-                logger.warning(f"Некорректный regex в forbidden: {pattern}")
-                continue
-        return False, ""
+        # v6.8: Guard - needs_manual_review поднимает риск
+        if needs_manual_review:
+            flags.append("Требуется ручная проверка")
+            if risk_level == "low":
+                risk_level = "medium"
+            logger.info(
+                f"[{self.VERSION}] needs_manual_review -> риск повышен до {risk_level}"
+            )
 
-    def _build_comment(
-        self,
-        tender_type: str,
-        cost_price: float,
-        recommended_price: Optional[float],
-        margin_percent: float,
-    ) -> str:
-        """Формирует комментарий к анализу."""
-        lines = [f"Анализ тендера типа «{tender_type}»", ""]
-        lines.append(f"Расчётная себестоимость: {cost_price:,.0f} ₽")
-        if recommended_price:
-            lines.append(f"Рекомендуемая цена: {recommended_price:,.0f} ₽")
-        lines.append(f"Маржа: {margin_percent:.1f}%")
-        return "\n".join(lines)
+        return {
+            "risk_level": risk_level,
+            "decision": decision,
+            "flags": flags,
+            "needs_manual_review": needs_manual_review or len(flags) > 0,
+        }

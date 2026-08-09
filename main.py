@@ -21,6 +21,9 @@ import json
 import csv
 from pathlib import Path
 from datetime import datetime
+from core.calculation.calculator import TenderCalculator
+from core.risk_rules import RiskAnalyzer
+from core.tender_type import get_type_detector
 
 # Настройка логирования
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -294,7 +297,15 @@ def run_analyze(
 
     # ← v6.6-r2: Обновлённые импорты
     searcher = create_searcher()
-    analyzer = TenderAnalyzer()
+    # ← v6.8: Инициализация компонентов
+    calculator = TenderCalculator()
+    risk_analyzer = RiskAnalyzer()
+    type_detector = get_type_detector()
+    analyzer = TenderAnalyzer(
+        calculator=calculator,
+        risk_analyzer=risk_analyzer,
+        type_detector=type_detector,
+    )
 
     cache = None
     try:
@@ -307,7 +318,7 @@ def run_analyze(
     detailed = None
     if not skip_detail:
         try:
-            detailed = DetailedParser(cache=cache)
+            detailed = DetailedParser()
             logger.info("📄 DetailedParser инициализирован")
         except Exception as e:
             logger.warning(f"⚠️ DetailedParser не инициализирован: {e}")
@@ -485,11 +496,16 @@ def run_analyze(
                 f"regions_count={tender_info.get('regions_count', 'N/A')}"
             )
 
+            classification = None
+            confidence = 0.0
+            type_hint = detail.tender_type_hint if detail else None
+
             analysis = analyzer.analyze(
-                nmck=tender.nmck,
-                region=detail.customer_region if detail else tender.region,
-                tender_text=tender_text,
                 tender_info=tender_info,
+                documents_text=documents_text,
+                llm_classification=classification,
+                llm_confidence=confidence,
+                tender_type_hint=type_hint,
             )
 
             # === DEBUG LOG ===
@@ -615,7 +631,15 @@ def run_interactive():
         sys.exit(1)
 
     # ← v6.6-r2: Обновлённый импорт
-    analyzer = TenderAnalyzer()
+    # ← v6.8: Инициализация компонентов
+    calculator = TenderCalculator()
+    risk_analyzer = RiskAnalyzer()
+    type_detector = get_type_detector()
+    analyzer = TenderAnalyzer(
+        calculator=calculator,
+        risk_analyzer=risk_analyzer,
+        type_detector=type_detector,
+    )
 
     print("\n" + "=" * 60)
     print("📝 ИНТЕРАКТИВНЫЙ РЕЖИМ")
