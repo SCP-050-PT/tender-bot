@@ -23,7 +23,7 @@ from core.risk_rules import RiskAnalyzer
 from core.tender_type import TenderTypeDetector
 from core.param_extractor import TenderParamExtractor
 from utils.llm_client import YandexGPTClient
-
+from core.calculation.calculation_result import CalculationResult
 
 @dataclass
 class AnalysisResult:
@@ -40,14 +40,45 @@ class AnalysisResult:
     details: Dict[str, Any]
     comment: str = ""
     review_reason: str = ""
-    # v6.8: новые поля
-    type_detection_source: str = ""  # откуда определён тип
-    classification_method: str = ""  # classify / extract / hint / fallback
-    guards_triggered: List[str] = None  # какие guard'ы сработали
+    type_detection_source: str = ""
+    classification_method: str = ""
+    guards_triggered: List[str] = None
+    nmck: float = 0.0
 
     def __post_init__(self):
         if self.guards_triggered is None:
             self.guards_triggered = []
+
+    # ==================== v6.8.5: НОВЫЕ МЕТОДЫ ====================
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Сериализует результат в dict для JSON/CSV."""
+        return {
+            "tender_type": self.tender_type,
+            "cost_price": self.cost_price,
+            "recommended_price": self.recommended_price,
+            "margin_percent": self.margin_percent,
+            "risk_level": self.risk_level,
+            "decision": self.decision,
+            "needs_manual_review": self.needs_manual_review,
+            "llm_confidence": self.llm_confidence,
+            "details": self.details,
+            "comment": self.comment,
+            "review_reason": self.review_reason,
+            "type_detection_source": self.type_detection_source,
+            "classification_method": self.classification_method,
+            "guards_triggered": self.guards_triggered,
+            "nmck": self.nmck,
+        }
+
+    def _format_comment(self) -> str:
+        """Форматирует комментарий для Google Sheets (одна строка)."""
+        lines = [self.comment]
+        if self.review_reason:
+            lines.append(f"⚠️ {self.review_reason}")
+        if self.guards_triggered:
+            lines.append(f"Guards: {', '.join(self.guards_triggered)}")
+        return " | ".join(filter(None, lines))
 
 
 class TenderAnalyzer:
@@ -75,55 +106,65 @@ class TenderAnalyzer:
         documents_text: str = "",
         llm_classification: Optional[str] = None,
         llm_confidence: float = 0.0,
-        tender_type_hint: Optional[str] = None,  # v6.8: из detailed_parser
+        tender_type_hint: Optional[str] = None,
     ) -> AnalysisResult:
         """Анализирует тендер."""
         logger.info(f"Начинаю анализ тендера")
 
-        # v6.8: Каскадное определение типа
         tender_type, type_source, classification_method = self._resolve_type(
             tender_info, documents_text, llm_classification, tender_type_hint
         )
 
-        # v6.8: Guard'ы cross-type
         tender_info, guards = self._apply_cross_type_guards(tender_info, tender_type)
 
-        # v6.8: Разделённое извлечение (если нужно)
         extracted = self._extract_params_if_needed(
             tender_info, documents_text, tender_type
         )
 
-        # Расчёт
         result = self._calculate(tender_info, tender_type, documents_text)
 
-        # Анализ рисков
+        # Если result — dict (от combined), конвертируем
+        if isinstance(result, dict):
+            result_obj = CalculationResult(
+                cost_price=result.get("cost_price", 0.0),
+                recommended_price=result.get("recommended_price", 0.0),
+                margin_percent=result.get("margin_percent", 0.0),
+                margin_rub=result.get("recommended_price", 0.0) - result.get("cost_price", 0.0),
+                transport_cost=0.0,
+                subcontractor_cost=0.0,
+                needs_manual_review=result.get("needs_manual_review", False),
+                review_reason=result.get("review_reason", ""),
+                details=result.get("details", {}),
+            )
+        else:
+            result_obj = result
+
         risk_result = self.risk_analyzer.analyze(
             tender_type=tender_type,
             nmck=tender_info.get("nmck", 0),
-            cost_price=result["cost_price"],
-            margin_percent=result["margin_percent"],
+            cost_price=result_obj.cost_price,
+            margin_percent=result_obj.margin_percent,
             deadline_days=tender_info.get("deadline_days", 30),
             region=tender_info.get("region", ""),
-            needs_manual_review=result.get("needs_manual_review", False),
+            needs_manual_review=result_obj.needs_manual_review,
         )
 
-        # v6.8: Формируем комментарий с объяснением
         comment = self._build_comment(
-            tender_type, result, type_source, classification_method, guards
+            tender_type, result_obj, type_source, classification_method, guards
         )
 
         return AnalysisResult(
             tender_type=tender_type,
-            cost_price=result["cost_price"],
-            recommended_price=result["recommended_price"],
-            margin_percent=result["margin_percent"],
+            cost_price=result_obj.cost_price,
+            recommended_price=result_obj.recommended_price,
+            margin_percent=result_obj.margin_percent,
             risk_level=risk_result["risk_level"],
             decision=risk_result["decision"],
-            needs_manual_review=result.get("needs_manual_review", False),
+            needs_manual_review=result_obj.needs_manual_review,
             llm_confidence=llm_confidence,
-            details=result.get("details", {}),
+            details=result_obj.details,
             comment=comment,
-            review_reason=result.get("review_reason", ""),
+            review_reason=result_obj.review_reason,
             type_detection_source=type_source,
             classification_method=classification_method,
             guards_triggered=guards,
@@ -293,8 +334,11 @@ class TenderAnalyzer:
         prompt = self._build_extraction_prompt(tender_type, documents_text)
         try:
             response = self.llm_client.extract(prompt)
-            # Парсим ответ
-            extracted = self._parse_extraction_response(response)
+            # extract() уже возвращает dict (распарсенный JSON)
+            if isinstance(response, dict):
+                extracted = response
+            else:
+                extracted = self._parse_extraction_response(response)
             # Мержим с tender_info
             for key, value in extracted.items():
                 if value is not None and tender_info.get(key) is None:
@@ -400,24 +444,27 @@ class TenderAnalyzer:
         else:
             return self._create_manual_review_result("Неизвестный тип тендера")
 
-    def _calculate_sout(self, tender_info: Dict[str, Any]) -> Dict[str, Any]:
+    def _calculate_sout(self, tender_info: Dict[str, Any]) -> CalculationResult:
         """Расчёт СОУТ."""
         rm_total = tender_info.get("rm_total", 0)
         if not rm_total:
             return self._create_manual_review_result("Не определено количество РМ")
 
-        result = self.calculator.calculate_sout(
+        return self.calculator.calculate_sout(
             rm_total=rm_total,
             variant=tender_info.get("variant", 1),
             addresses_count=tender_info.get("addresses_count", 1),
-            has_iii=tender_info.get("has_iii", False),
-            region=tender_info.get("region", ""),
+            cities_count=tender_info.get("cities_count", 1),
+            regions_count=tender_info.get("regions_count", 1),
+            trip_days=tender_info.get("trip_days", 3),
+            rm_with_iii=tender_info.get("rm_with_iii", 0),
+            is_seasonal=tender_info.get("is_seasonal", False),
+            transport_cost=tender_info.get("transport_cost", 0),
         )
-        return result
 
     def _calculate_education(
         self, tender_info: Dict[str, Any], documents_text: str
-    ) -> Dict[str, Any]:
+    ) -> CalculationResult:
         """Расчёт обучения."""
         students = tender_info.get("students_count", 0)
         if not students:
@@ -425,10 +472,9 @@ class TenderAnalyzer:
                 "Не определено количество слушателей"
             )
 
-        # v6.8: Определяем тип документов
         doc_types = self._detect_education_doc_types(tender_info, documents_text)
 
-        result = self.calculator.calculate_education(
+        return self.calculator.calculate_education(
             students_count=students,
             protocols_count=doc_types.get("protocols", 0),
             qual_certs=doc_types.get("qual_certs", 0),
@@ -436,7 +482,65 @@ class TenderAnalyzer:
             is_distance=tender_info.get("is_distance", False),
             teacher_days=tender_info.get("teacher_days", 0),
         )
-        return result
+
+    def _calculate_opr(self, tender_info: Dict[str, Any]) -> CalculationResult:
+        """Расчёт ОПР."""
+        positions = tender_info.get("opr_positions", 0)
+        if not positions:
+            if tender_info.get("rm_total"):
+                positions = tender_info["rm_total"]
+                logger.info(
+                    f"[{self.VERSION}] ОПР: используем rm_total={positions} как opr_positions"
+                )
+            else:
+                return self._create_manual_review_result(
+                    "Не определено количество должностей ОПР"
+                )
+
+        return self.calculator.calculate_opr(
+            positions=positions,
+            persons=tender_info.get("opr_persons", positions),
+        )
+
+    def _calculate_plk(self, tender_info: Dict[str, Any]) -> CalculationResult:
+        """Расчёт ПЛК."""
+        points = tender_info.get("measurement_points", 0)
+        if not points:
+            return self._create_manual_review_result(
+                "Не определено количество точек замера"
+            )
+
+        return self.calculator.calculate_plk(
+            points=points,
+            measurement_types=tender_info.get("measurement_types", []),
+        )
+
+    def _calculate_combined(self, tender_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Расчёт комбинированного тендера."""
+        results = []
+
+        if tender_info.get("rm_total"):
+            results.append(self._calculate_sout(tender_info))
+
+        if tender_info.get("students_count"):
+            results.append(self._calculate_education(tender_info, ""))
+
+        if not results:
+            return self._create_manual_review_result(
+                "Не определены параметры комбинированного тендера"
+            ).to_dict()
+
+        total_cost = sum(r.cost_price for r in results)
+        total_recommended = sum(r.recommended_price for r in results)
+
+        return {
+            "cost_price": total_cost,
+            "recommended_price": total_recommended,
+            "margin_percent": 10.0,
+            "needs_manual_review": True,
+            "review_reason": "Комбинированный тендер - требуется ручная проверка",
+            "details": {"parts": [r.to_dict() for r in results]},
+        }
 
     def _detect_education_doc_types(
         self, tender_info: Dict[str, Any], documents_text: str
@@ -471,89 +575,26 @@ class TenderAnalyzer:
         # Default: protocols
         return {"protocols": students, "qual_certs": 0, "diplomas": 0}
 
-    def _calculate_opr(self, tender_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Расчёт ОПР."""
-        positions = tender_info.get("opr_positions", 0)
-        if not positions:
-            # v6.8: Fallback на rm_total для ОПР
-            if tender_info.get("rm_total"):
-                positions = tender_info["rm_total"]
-                logger.info(
-                    f"[{self.VERSION}] ОПР: используем rm_total={positions} как opr_positions"
-                )
-            else:
-                return self._create_manual_review_result(
-                    "Не определено количество должностей ОПР"
-                )
 
-        result = self.calculator.calculate_opr(
-            positions=positions,
-            persons=tender_info.get("opr_persons", positions),
-        )
-        return result
-
-    def _calculate_plk(self, tender_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Расчёт ПЛК."""
-        points = tender_info.get("measurement_points", 0)
-        if not points:
-            return self._create_manual_review_result(
-                "Не определено количество точек замера"
-            )
-
-        result = self.calculator.calculate_plk(
-            points=points,
-            measurement_types=tender_info.get("measurement_types", []),
-        )
-        return result
-
-    def _calculate_combined(self, tender_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Расчёт комбинированного тендера."""
-        # Расчитываем каждую часть отдельно
-        results = []
-
-        if tender_info.get("rm_total"):
-            sout_result = self._calculate_sout(tender_info)
-            results.append(sout_result)
-
-        if tender_info.get("students_count"):
-            edu_result = self._calculate_education(tender_info, "")
-            results.append(edu_result)
-
-        if not results:
-            return self._create_manual_review_result(
-                "Не определены параметры комбинированного тендера"
-            )
-
-        # Суммируем
-        total_cost = sum(r["cost_price"] for r in results)
-        total_recommended = sum(r["recommended_price"] for r in results)
-
-        return {
-            "cost_price": total_cost,
-            "recommended_price": total_recommended,
-            "margin_percent": 10.0,
-            "needs_manual_review": True,
-            "review_reason": "Комбинированный тендер - требуется ручная проверка",
-            "details": {"parts": results},
-        }
-
-    def _create_manual_review_result(self, reason: str) -> Dict[str, Any]:
+    def _create_manual_review_result(self, reason: str) -> CalculationResult:
         """Создаёт результат с требованием ручной проверки."""
-        return {
-            "cost_price": 0.0,
-            "recommended_price": 0.0,
-            "margin_percent": 0.0,
-            "needs_manual_review": True,
-            "review_reason": reason,
-            "details": {},
-        }
+        return CalculationResult(
+            cost_price=0.0,
+            recommended_price=0.0,
+            margin_percent=0.0,
+            margin_rub=0.0,
+            transport_cost=0.0,
+            subcontractor_cost=0.0,
+            needs_manual_review=True,
+            review_reason=reason,
+        )
 
     # ==================== v6.8: КОММЕНТАРИЙ ====================
 
     def _build_comment(
         self,
         tender_type: str,
-        result: Dict[str, Any],
+        result: CalculationResult,
         type_source: str,
         classification_method: str,
         guards: List[str],
@@ -562,9 +603,9 @@ class TenderAnalyzer:
         lines = [
             f"Анализ тендера типа «{tender_type}»",
             "",
-            f"Расчётная себестоимость: {result['cost_price']:,.0f} ₽",
-            f"Рекомендуемая цена: {result['recommended_price']:,.0f} ₽",
-            f"Маржа: {result['margin_percent']:.1f}%",
+            f"Расчётная себестоимость: {result.cost_price:,.0f} ₽",
+            f"Рекомендуемая цена: {result.recommended_price:,.0f} ₽",
+            f"Маржа: {result.margin_percent:.1f}%",
             "",
             f"Определение типа: {type_source} ({classification_method})",
         ]
@@ -575,8 +616,8 @@ class TenderAnalyzer:
             for guard in guards:
                 lines.append(f"  • {guard}")
 
-        if result.get("review_reason"):
+        if result.review_reason:
             lines.append("")
-            lines.append(f"⚠️ {result['review_reason']}")
+            lines.append(f"⚠️ {result.review_reason}")
 
         return "\n".join(lines)

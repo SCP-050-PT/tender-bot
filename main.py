@@ -4,15 +4,11 @@ main.py
 Интеграционный скрипт TENDER-BOT v2.
 Пайплайн: Поиск → Детальный парсинг → LLM-анализ → Расчёт → Риски → Google Sheets
 
-ИСПРАВЛЕНО (31.07.2026 v6.6-r2):
-  - Импорты обновлены под рефакторинг:
-    * core.searcher → core.search
-    * core.detailed_parser → core.parsers
-    * core.analyzer → core.analysis
-  - Удалён мёртвый импорт get_url_builder (tender.url уже содержит URL)
-  - Удалён мёртвый импорт get_type_detector (не используется в main.py)
-  - Упрощён _build_sheets_row(): используется tender.url
-  - Убраны isinstance(dict) проверки для cities_count/addresses_count
+ИСПРАВЛЕНО (v6.8.5):
+  - DetailedParser инициализируется с session_manager из searcher
+  - Используется fetch_and_parse() вместо parse() с неправильной сигнатурой
+  - Fallback на поисковые данные (title, region, customer) при блокировке common-info
+  - Добавлен _detect_type_from_title() для fallback-типа
 """
 
 import sys
@@ -52,23 +48,82 @@ except ImportError:
     logger = logging.getLogger("tender_bot")
 
 
-# ← v6.6-r2: Обновлённые импорты под рефакторинг
 from core.google_sheets import SHEET_COLUMNS
 from utils.price_parser import (
     format_for_sheets as _format_nmck,
     format_for_sheets as _format_price,
 )
 
-# ← v6.6-r2: Удалён: from utils.url_builder import get_url_builder (мёртвый код)
-#            tender.url уже содержит правильный URL от SearchUrlBuilder
+from core.search import create_searcher
+from core.parsers import DetailedParser
+from core.analysis import TenderAnalyzer
 
-# ← v6.6-r2: Удалён: from core.tender_type import get_type_detector
-#            Не используется в main.py (Singleton в analyzer.py)
 
-# ← v6.6-r2: Обновлённые импорты
-from core.search import create_searcher                    # было: core.searcher
-from core.parsers import DetailedParser                    # было: core.detailed_parser
-from core.analysis import TenderAnalyzer                   # было: core.analyzer
+def _detect_type_from_title(title: str) -> str:
+    """Определяет тип тендера по названию из поисковой выдачи (fallback)."""
+    if not title:
+        return ""
+    title_lower = title.lower()
+    if any(
+        kw in title_lower
+        for kw in [
+            "соут",
+            "специальная оценка условий труда",
+            "оценка условий труда",
+            "оценка рабочих мест",
+            "специальная оценка",
+            "вредные производственные факторы",
+            "класс условий труда",
+            "карта соут",
+            "протоколы измерений",
+        ]
+    ):
+        return "sout"
+    if any(
+        kw in title_lower
+        for kw in [
+            "обучение охране труда",
+            "обучение по охране труда",
+            "программа обучения",
+            "программа повышения квалификации",
+            "переподготовка",
+            "повышение квалификации",
+            "профессиональное обучение",
+            "слушатели",
+            "протоколы обучения",
+            "удостоверение",
+            "инструктаж",
+            "стажировка",
+        ]
+    ):
+        return "education"
+    if any(
+        kw in title_lower
+        for kw in [
+            "опр",
+            "оценка профессиональных рисков",
+            "профессиональный риск",
+            "проф. риск",
+            "профриск",
+            "мероприятия по снижению рисков",
+            "идентификация опасностей",
+        ]
+    ):
+        return "opr"
+    if any(
+        kw in title_lower
+        for kw in [
+            "производственный контроль",
+            "плк",
+            "лабораторные исследования",
+            "лабораторный контроль",
+            "замеры шума",
+            "замеры вибрации",
+            "санитарно-гигиенические исследования",
+        ]
+    ):
+        return "plk"
+    return ""
 
 
 def _build_tender_text(detail, documents_text: str) -> str:
@@ -87,7 +142,7 @@ def _build_tender_text(detail, documents_text: str) -> str:
         f"ОБЕСПЕЧЕНИЕ КОНТРАКТА: {detail.contract_guarantee or 'не указано'}",
         f"АДРЕСОВ ПОСТАВКИ: {detail.addresses_count or 0}",
         f"ГОРОДОВ ПОСТАВКИ: {detail.cities_count or 0}",
-        f"РЕГИОНОВ ПОСТАВКИ: {detail.regions_count or 1}",  # ← v6.6-r2: добавлено
+        f"РЕГИОНОВ ПОСТАВКИ: {detail.regions_count or 1}",
     ]
 
     if documents_text and len(documents_text) > 100:
@@ -150,7 +205,6 @@ def _get_guarantee_info(detail, analysis) -> tuple:
     contract_guarantee = ""
     guarantee_method = ""
 
-    # Приоритет: detail (HTML-парсинг)
     if detail:
         raw_app = (detail.application_guarantee or "").strip()
         raw_contract = (detail.contract_guarantee or "").strip()
@@ -163,7 +217,6 @@ def _get_guarantee_info(detail, analysis) -> tuple:
         if raw_method:
             guarantee_method = raw_method
 
-    # Fallback: analysis.details (LLM-результат)
     if analysis and hasattr(analysis, "details") and analysis.details:
         details = analysis.details
         if isinstance(details, dict):
@@ -181,21 +234,23 @@ def _get_guarantee_info(detail, analysis) -> tuple:
             if not guarantee_method and getattr(details, "guarantee_method", None):
                 guarantee_method = details.guarantee_method
 
-    # Fallback: requirements
     if detail and detail.requirements and not app_guarantee:
         req_lower = detail.requirements.lower()
         if "не требуется" in req_lower:
             app_guarantee = "Не требуется"
             contract_guarantee = "Не требуется"
 
-    # Fallback: comment
-    if analysis and hasattr(analysis, "comment") and analysis.comment and not app_guarantee:
+    if (
+        analysis
+        and hasattr(analysis, "comment")
+        and analysis.comment
+        and not app_guarantee
+    ):
         comment_lower = analysis.comment.lower()
         if "не требуется" in comment_lower:
             app_guarantee = "Не требуется"
             contract_guarantee = "Не требуется"
 
-    # Критичный fix: если пусто — "Не требуется"
     if not app_guarantee:
         app_guarantee = "Не требуется"
     if not contract_guarantee:
@@ -219,8 +274,6 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     else:
         procurement = law
 
-    # ← v6.6-r2: Используем tender.url (уже содержит правильный URL от SearchUrlBuilder)
-    # Удалён мёртвый код с get_url_builder()
     tender_url = tender.url
 
     needs_manual = getattr(analysis, "needs_manual_review", False)
@@ -262,7 +315,6 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
     logger.info("🔍 РЕЖИМ: Только парсинг (без LLM)")
     logger.info("=" * 60)
 
-    # ← v6.6-r2: Обновлённый импорт
     searcher = create_searcher()
 
     output_file = f"data/search_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -295,9 +347,7 @@ def run_analyze(
             logger.error(f"   • {err}")
         sys.exit(1)
 
-    # ← v6.6-r2: Обновлённые импорты
     searcher = create_searcher()
-    # ← v6.8: Инициализация компонентов
     calculator = TenderCalculator()
     risk_analyzer = RiskAnalyzer()
     type_detector = get_type_detector()
@@ -318,8 +368,9 @@ def run_analyze(
     detailed = None
     if not skip_detail:
         try:
-            detailed = DetailedParser()
-            logger.info("📄 DetailedParser инициализирован")
+            # ← v6.8.5: Передаём session_manager из searcher!
+            detailed = DetailedParser(session_manager=searcher.session_manager)
+            logger.info("📄 DetailedParser инициализирован с session_manager")
         except Exception as e:
             logger.warning(f"⚠️ DetailedParser не инициализирован: {e}")
             logger.warning("   Будет использоваться упрощённый анализ (только title)")
@@ -353,16 +404,21 @@ def run_analyze(
         detail = None
         documents_text = ""
         tender_text = ""
-
+        logger.info(
+            f"[DEBUG] tender.title='{tender.title}', tender.region='{getattr(tender, 'region', 'N/A')}', tender.customer='{getattr(tender, 'customer', 'N/A')}'"
+        )
         # === ШАГ 1: Детальный парсинг ===
         if detailed and not skip_detail:
             try:
                 law_clean = tender.law.replace("-FZ", "") if tender.law else "44"
-                detail = detailed.parse(
+                detail = detailed.fetch_and_parse(
                     reg_number=tender.tender_id,
                     law_type=law_clean,
-                    notice_guid=tender.notice_guid or "",
-                    nmck=tender.nmck,
+                    notice_guid=getattr(tender, "notice_guid", None) or "",
+                    nmck=tender.nmck or 0,
+                    fallback_title=tender.title or "",
+                    fallback_region=getattr(tender, "region", "") or "",
+                    fallback_customer=getattr(tender, "customer", "") or "",
                 )
 
                 if detail:
@@ -370,7 +426,9 @@ def run_analyze(
                         f"   ✅ Детали получены: {detail.customer_region or 'регион не определён'}"
                     )
                     logger.info(f"   📄 Документов: {len(detail.documents)}")
-                    logger.info(f"   🏢 ЭТП: {detail.platform_name or 'не определена'}")
+                    logger.info(
+                        f"   🏢 ЭТП: {detail.platform_name or detail.etp or 'не определена'}"
+                    )
                     logger.info(
                         f"   🔒 Обеспечение: {detail.application_guarantee or 'не указано'}"
                     )
@@ -420,43 +478,47 @@ def run_analyze(
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
                     "platform_name": detail.platform_name or "",
                     "requirements": detail.requirements or "",
-                    "application_guarantee": (detail.application_guarantee or "").strip(),
+                    "application_guarantee": (
+                        detail.application_guarantee or ""
+                    ).strip(),
                     "contract_guarantee": (detail.contract_guarantee or "").strip(),
                     "guarantee_method": (detail.guarantee_method or "").strip(),
                 }
 
-                # ← v6.6-r2: Упрощённая логика cities_count/regions_count
-                # AddressParser теперь возвращает int, не dict
                 tender_info["cities_count"] = detail.cities_count or 1
                 tender_info["regions_count"] = detail.regions_count or 1
                 tender_info["addresses_count"] = detail.addresses_count or 1
 
-                # Для СОУТ/combined: логика выездов
-                tender_type_lower = (detail.tender_type or "").lower()
-                is_sout = tender_type_lower in ("sout", "combined", "соут", "комбинированный")
+                tender_type_lower = (detail.tender_type_hint or "").lower()
+                is_sout = tender_type_lower in (
+                    "sout",
+                    "combined",
+                    "соут",
+                    "комбинированный",
+                )
 
                 if not tender_type_lower:
                     name_lower = (detail.purchase_name or "").lower()
                     is_sout = any(
                         kw in name_lower
                         for kw in [
-                            "соут", "специальная оценка условий труда",
-                            "оценка условий труда", "оценка рабочих мест",
+                            "соут",
+                            "специальная оценка условий труда",
+                            "оценка условий труда",
+                            "оценка рабочих мест",
                             "специальная оценка",
                         ]
                     )
 
                 if is_sout:
                     logger.info(
-                        f"[v6.6-r2] СОУТ/combined: cities={detail.cities_count}, "
+                        f"[v6.8.5] СОУТ/combined: cities={detail.cities_count}, "
                         f"regions={detail.regions_count}, addresses={detail.addresses_count}"
                     )
 
-                # Для обучения: 1 площадка = 1 адрес
-                if detail.tender_type == "education":
+                if detail.tender_type_hint == "education":
                     tender_info["addresses_count"] = 1
 
-                # Параметры из Detail с приоритетом КТРУ
                 if detail.rm_total > 0:
                     tender_info["rm_total"] = detail.rm_total
                     tender_info["rm_total_source"] = "ktru"
@@ -466,17 +528,20 @@ def run_analyze(
                 if detail.points_count > 0:
                     tender_info["points_count"] = detail.points_count
 
-                # Очные параметры
                 if detail.has_full_time:
                     tender_info["has_full_time"] = True
                     tender_info["is_distance"] = False
-                for field in ["teacher_days", "accommodation_nights", "transport_km",
-                              "venue_rent_days", "manikin_days"]:
+                for field in [
+                    "teacher_days",
+                    "accommodation_nights",
+                    "transport_km",
+                    "venue_rent_days",
+                    "manikin_days",
+                ]:
                     val = getattr(detail, field, 0) or 0
                     if val > 0:
                         tender_info[field] = val
 
-                # Дополнительные параметры
                 if detail.trip_days > 0:
                     tender_info["trip_days"] = detail.trip_days
                 tender_info["is_seasonal"] = getattr(detail, "is_seasonal", False)
@@ -484,21 +549,29 @@ def run_analyze(
                     tender_info["opr_positions"] = detail.opr_positions
                 if detail.opr_persons > 0:
                     tender_info["opr_persons"] = detail.opr_persons
-                tender_info["needs_subcontractor"] = getattr(detail, "needs_subcontractor", False)
+                tender_info["needs_subcontractor"] = getattr(
+                    detail, "needs_subcontractor", False
+                )
 
-            # === DEBUG LOG ===
+            # ← v6.8.5: Fallback тип из title, если detail не дал тип
+            type_hint = detail.tender_type_hint if detail else None
+            if not type_hint and tender.title:
+                type_hint = _detect_type_from_title(tender.title)
+                if type_hint:
+                    logger.info(f"[v6.8.5] Тип определён по title: {type_hint}")
+
             logger.info(
                 f"[DEBUG] Passing to analyzer: nmck={tender.nmck}, "
                 f"region={detail.customer_region if detail else tender.region}, "
                 f"text_length={len(tender_text)}, "
                 f"students_count={tender_info.get('students_count', 'N/A')}, "
                 f"rm_total={tender_info.get('rm_total', 'N/A')}, "
-                f"regions_count={tender_info.get('regions_count', 'N/A')}"
+                f"regions_count={tender_info.get('regions_count', 'N/A')}, "
+                f"type_hint={type_hint}"
             )
 
             classification = None
             confidence = 0.0
-            type_hint = detail.tender_type_hint if detail else None
 
             analysis = analyzer.analyze(
                 tender_info=tender_info,
@@ -508,7 +581,6 @@ def run_analyze(
                 tender_type_hint=type_hint,
             )
 
-            # === DEBUG LOG ===
             logger.info(
                 f"[DEBUG] Analysis result: type={analysis.tender_type}, "
                 f"cost_price={analysis.cost_price}, "
@@ -521,11 +593,9 @@ def run_analyze(
             result_dict = analysis.to_dict()
             results.append(result_dict)
 
-            # === ШАГ 4: Формирование строки таблицы ===
             row = _build_sheets_row(analysis, detail, tender)
             sheets_rows.append(row)
 
-            # === ШАГ 4.5: Запись в Google Sheets ===
             if sheets_manager:
                 try:
                     success = sheets_manager.add_tender_to_top(
@@ -538,7 +608,6 @@ def run_analyze(
                 except Exception as e:
                     logger.warning(f"   ⚠️ Ошибка записи в Sheets: {e}")
 
-            # === Красивый вывод ===
             print(f"\n{'=' * 60}")
             print(f"📊 РЕЗУЛЬТАТ: {tender.tender_id}")
             print(f"{'=' * 60}")
@@ -562,6 +631,9 @@ def run_analyze(
 
         except Exception as e:
             logger.error(f"❌ Ошибка анализа тендера {tender.tender_id}: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
             continue
 
     # === Сохранение результатов ===
@@ -630,8 +702,6 @@ def run_interactive():
             logger.error(f"   • {err}")
         sys.exit(1)
 
-    # ← v6.6-r2: Обновлённый импорт
-    # ← v6.8: Инициализация компонентов
     calculator = TenderCalculator()
     risk_analyzer = RiskAnalyzer()
     type_detector = get_type_detector()

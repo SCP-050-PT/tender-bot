@@ -2,11 +2,11 @@
 core/parsers/detailed_parser.py
 Детальный парсинг карточки тендера (common-info + документы).
 
-ИСПРАВЛЕНО (v6.8):
-- Регион 223-ФЗ извлекается из "Местонахождения" заказчика
-- Каскадное определение типа: Объект закупки -> Документы -> LLM
-- Улучшенный парсинг lot-list для 223-ФЗ
-- Улучшенное извлечение noticeGuid для 223-ФЗ
+ИСПРАВЛЕНО (v6.8.6):
+- Исправлен NameError: 'soup' is not defined в fetch_and_parse()
+- Улучшена проверка блокировки (не ловит "Личный кабинет" в навигации)
+- Добавлен парсинг РМ из КТРУ-таблицы
+- Улучшены селекторы для 44-ФЗ (регион, заказчик, ЭТП, НМЦК)
 """
 
 import re
@@ -18,7 +18,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from loguru import logger
 
-# v6.8: Словарь город -> регион для fallback
+# v6.8.5: Словарь город -> регион для fallback
 CITY_TO_REGION = {
     "москва": "Москва",
     "санкт-петербург": "Санкт-Петербург",
@@ -150,8 +150,12 @@ CITY_TO_REGION = {
 TYPE_KEYWORDS = {
     "sout": [
         "специальная оценка условий труда",
+        "специальной оценки условий труда",
+        "специальной оценке условий труда",
+        "специальную оценку условий труда",
         "соут",
         "оценка условий труда",
+        "оценки условий труда",
         "спецоценка",
         "вредные производственные факторы",
         "идентификация потенциально вредных",
@@ -349,16 +353,241 @@ class TenderDetail:
     lot_info: Optional[Dict] = None
     customer_address: Optional[str] = None
     type_detection_source: Optional[str] = None
+    # v6.8.5: Новые поля для данных из поисковой выдачи
+    purchase_name: Optional[str] = None
+    customer_name: Optional[str] = None
+    customer_region: Optional[str] = None
+    delivery_address: Optional[str] = None
+    purchase_method: Optional[str] = None
+    platform_name: Optional[str] = None
+    application_guarantee: Optional[str] = None
+    contract_guarantee: Optional[str] = None
+    guarantee_method: Optional[str] = None
+    documents_text: Optional[str] = None
+    addresses_count: int = 1
+    cities_count: int = 1
+    regions_count: int = 1
+    rm_total: int = 0
+    students_count: int = 0
+    points_count: int = 0
+    has_full_time: bool = False
+    teacher_days: int = 0
+    accommodation_nights: int = 0
+    transport_km: int = 0
+    venue_rent_days: int = 0
+    manikin_days: int = 0
+    trip_days: int = 0
+    is_seasonal: bool = False
+    opr_positions: int = 0
+    opr_persons: int = 0
+    needs_subcontractor: bool = False
 
 
 class DetailedParser:
     """Парсер детальной информации о тендере."""
 
-    def __init__(self):
-        logger.info("DetailedParser инициализирован (v6.8)")
+    def __init__(self, session_manager=None):
+        self.session_manager = session_manager
+        logger.info("DetailedParser инициализирован (v6.8.6)")
+
+    # ==================== v6.8.6: НОВЫЙ МЕТОД ====================
+
+    def fetch_and_parse(
+        self,
+        reg_number: str,
+        law_type: str,
+        notice_guid: str = "",
+        nmck: float = 0,
+        fallback_title: str = "",
+        fallback_region: str = "",
+        fallback_customer: str = "",
+    ) -> Optional[TenderDetail]:
+        """
+        Загружает common-info и парсит его.
+        При блокировке zakupki — возвращает fallback с данными из поисковой выдачи.
+        """
+        law = law_type if "FZ" in law_type else f"{law_type}-FZ"
+        law_clean = law.replace("-FZ", "")
+
+        # Формируем URL
+        if law_clean == "223":
+            url = f"https://zakupki.gov.ru/epz/order/notice/ea223/view/common-info.html?regNumber={reg_number}"
+        elif law_clean == "615":
+            url = f"https://zakupki.gov.ru/epz/order/notice/ea615/view/common-info.html?regNumber={reg_number}"
+        else:
+            url = f"https://zakupki.gov.ru/epz/order/notice/ea44/view/common-info.html?regNumber={reg_number}"
+
+        logger.info(f"   [v6.8.6] Загрузка common-info: {url}")
+
+        html = ""
+        status_code = None
+
+        # Загружаем HTML через session_manager
+        if self.session_manager:
+            try:
+                # v6.8.6: Добавляем Referer из поисковой выдачи
+                session = self.session_manager.get_primary_session()
+                headers = {
+                    "Referer": f"https://zakupki.gov.ru/epz/order/extendedsearch/results.html?searchString={reg_number}",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-Mode": "navigate",
+                }
+                response = session.get(url, timeout=30, headers=headers)
+                status_code = response.status_code
+                html = response.text
+                logger.info(
+                    f"   [v6.8.6] Статус: {status_code}, длина HTML: {len(html)}"
+                )
+            except Exception as e:
+                logger.warning(f"   [v6.8.6] Ошибка загрузки common-info: {e}")
+
+        # v6.8.6: Дебаг-логи — проверяем блокировку
+        is_blocked = False
+        soup_check = None
+        if html:
+            # Проверяем НАСТОЯЩУЮ блокировку (редирект на авторизацию)
+            # Ложные срабатывания: "Личный кабинет" в навигации, "Вход" в футере
+            # Истинная блокировка: title="Вход в личный кабинет" ИЛИ форма авторизации
+            soup_check = BeautifulSoup(html, "html.parser")
+
+            # Признаки истинной блокировки:
+            # 1. Форма входа (input type="password")
+            has_login_form = bool(soup_check.find("input", {"type": "password"}))
+            # 2. Title = "Авторизация" или "Вход"
+            title_tag = soup_check.find("title")
+            is_auth_title = (
+                title_tag
+                and any(
+                    word in title_tag.get_text()
+                    for word in ["Авторизация", "Вход", "Личный кабинет"]
+                )
+                if title_tag
+                else False
+            )
+            # 3. Отсутствие карточки тендера (cardMainInfo)
+            has_card = bool(soup_check.find("div", class_="cardMainInfo"))
+            # 4. Маленький HTML (< 5000 символов) без реальных данных
+            is_too_small = len(html) < 5000
+
+            # Блокировка = (форма входа ИЛИ auth title) И отсутствие карточки
+            # ИЛИ слишком маленький HTML
+            is_blocked = (
+                has_login_form or (is_auth_title and not has_card)
+            ) or is_too_small
+
+            if is_blocked:
+                logger.warning(
+                    f"   [v6.8.6] ⚠️ БЛОКИРОВКА: "
+                    f"login_form={has_login_form}, auth_title={is_auth_title}, "
+                    f"has_card={has_card}, len={len(html)}"
+                )
+            else:
+                logger.info(
+                    f"   [v6.8.6] ✅ common-info ОК: "
+                    f"has_card={has_card}, len={len(html)}"
+                )
+                # Сохраняем HTML для анализа
+                try:
+                    from pathlib import Path
+
+                    debug_path = Path(f"data/debug_{reg_number}_ok.html")
+                    debug_path.parent.mkdir(parents=True, exist_ok=True)
+                    debug_path.write_text(html[:2000], encoding="utf-8")
+                    logger.info(f"   [v6.8.6] HTML сохранён: {debug_path}")
+                except Exception:
+                    pass
+
+            # Дополнительная проверка: есть ли реальные данные в карточке
+            if not is_blocked and soup_check:
+                has_real_data = bool(
+                    soup_check.find("span", class_="cardMainInfo__purchaseLink")
+                    or soup_check.find("div", class_="cardMainInfo__section")
+                )
+                if not has_real_data and len(html) < 1000:
+                    is_blocked = True
+                    logger.warning(
+                        f"   [v6.8.6] ⚠️ Пустой HTML (len={len(html)}), возможна блокировка"
+                    )
+
+        # Если заблокировано — возвращаем fallback
+        if is_blocked or not html:
+            logger.info(f"   [v6.8.6] Используем fallback на поисковые данные")
+            return self._create_fallback_detail(
+                reg_number=reg_number,
+                law=law,
+                title=fallback_title,
+                region=fallback_region,
+                customer=fallback_customer,
+                nmck=nmck,
+            )
+
+        # Парсим HTML
+        return self.parse(html=html, tender_id=reg_number, law=law)
+
+    def _create_fallback_detail(
+        self,
+        reg_number: str,
+        law: str,
+        title: str,
+        region: str,
+        customer: str,
+        nmck: float,
+    ) -> TenderDetail:
+        """Создаёт fallback TenderDetail из поисковых данных."""
+        # v6.8.6: Определяем тип по названию
+        tender_type_hint, type_source = self._detect_type_from_title(title)
+
+        logger.info(
+            f"   [v6.8.6] Fallback: type={tender_type_hint}, source={type_source}"
+        )
+
+        return TenderDetail(
+            tender_id=reg_number,
+            law=law,
+            title=title,
+            customer=customer or "",
+            region=region or "",
+            etp="",
+            nmck=nmck or 0.0,
+            publish_date="",
+            deadline_date="",
+            requirements="",
+            platform_name=etp,
+            warranty_required=False,
+            warranty_percent=0.0,
+            documents=[],
+            raw_html="",
+            notice_guid=None,
+            tender_type_hint=tender_type_hint,
+            type_detection_source=type_source,
+            purchase_name=title,
+            customer_name=customer or "",
+            customer_region=region or "",
+        )
+
+    def _detect_type_from_title(self, title: str) -> tuple:
+        if not title:
+            return None, "empty_title"
+
+        title_lower = title.lower()
+
+        for ttype, keywords in TYPE_KEYWORDS.items():
+            for keyword in keywords:
+                # Проверяем точное вхождение
+                if keyword.lower() in title_lower:
+                    return ttype, f"title_keyword:{keyword}"
+
+                # Проверяем базовую форму (без окончаний)
+                base = keyword.lower().replace("ая ", "а ").replace("ой ", "о ")
+                if base in title_lower:
+                    return ttype, f"title_keyword_stem:{keyword}"
+
+        return None, "undetermined"
+
+    # ==================== ОСНОВНОЙ МЕТОД ПАРСИНГА ====================
 
     def parse(self, html: str, tender_id: str, law: str) -> Optional[TenderDetail]:
-        """Парсит детальную информацию."""
+        """Парсит детальную информацию из HTML."""
         soup = BeautifulSoup(html, "html.parser")
 
         notice_guid = self._extract_notice_guid(soup, law)
@@ -378,6 +607,14 @@ class DetailedParser:
         warranty_info = self._extract_warranty(soup)
         documents = self._extract_documents(soup)
         customer_address = self._extract_customer_address(soup, law)
+
+        # v6.8.6: Извлекаем РМ из КТРУ
+        rm_from_ktru = self._extract_rm_from_ktru(soup)
+
+        # v6.8.6: Заполняем новые поля
+        purchase_name = title
+        customer_name = customer
+        customer_region = region
 
         return TenderDetail(
             tender_id=tender_id,
@@ -399,6 +636,10 @@ class DetailedParser:
             lot_info=lot_info,
             customer_address=customer_address,
             type_detection_source=type_source,
+            purchase_name=purchase_name,
+            customer_name=customer_name,
+            customer_region=customer_region,
+            rm_total=rm_from_ktru,  # v6.8.6: РМ из КТРУ
         )
 
     # ==================== v6.8: НОВЫЕ МЕТОДЫ ====================
@@ -409,9 +650,9 @@ class DetailedParser:
             return None
 
         patterns = [
-            r'noticeGuid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
-            r'purchaseNoticeGuid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
-            r'guid[=:]\s*["\']([0-9a-fA-F\-]{36})["\']',
+            r'noticeGuid[=:]\s*["\']' + r'([0-9a-fA-F\-]{36})' + r'["\']',
+            r'purchaseNoticeGuid[=:]\s*["\']' + r'([0-9a-fA-F\-]{36})' + r'["\']',
+            r'guid[=:]\s*["\']' + r'([0-9a-fA-F\-]{36})' + r'["\']',
         ]
 
         html_text = str(soup)
@@ -428,7 +669,7 @@ class DetailedParser:
             if match:
                 guid = match.group(1)
                 logger.info(f"    [noticeGuid] Извлечен из ссылки: {guid}")
-                return guid
+                return match.group(1)
 
         logger.warning("    [noticeGuid] Не найден в HTML 223-ФЗ")
         return None
@@ -539,7 +780,7 @@ class DetailedParser:
                     text = row.get_text(separator=" ", strip=True)
                     if "местонахождение" in text.lower() or "адрес" in text.lower():
                         address_match = re.search(
-                            r"(?:местонахождение|адрес)[\s:]*(.+?)(?:\n|$)",
+                            r"(?:местонахождение|адрес)[\s:]*(.+?)(?:|$)",
                             text,
                             re.IGNORECASE,
                         )
@@ -590,6 +831,17 @@ class DetailedParser:
         self, soup: BeautifulSoup, law: str, lot_info: Optional[Dict]
     ) -> str:
         """Извлекает регион с учётом типа закона."""
+        # v6.8.6: Сначала ищем явный блок "Регион" в контактной информации
+        for section in soup.find_all("section", class_="blockInfo__section"):
+            title_span = section.find("span", class_="section__title")
+            if title_span and title_span.get_text(strip=True) == "Регион":
+                content = section.find("span", class_="section__info")
+                if content:
+                    region = content.get_text(strip=True)
+                    logger.info(f"    [Region] Извлечен из блока 'Регион': {region}")
+                    return region
+
+        # Для 223-ФЗ: из адреса заказчика
         if law == "223-FZ":
             customer_address = self._extract_customer_address(soup, law)
             if customer_address:
@@ -608,6 +860,7 @@ class DetailedParser:
                     )
                     return region
 
+        # Fallback: старые селекторы
         region_elem = soup.find("span", string=re.compile("Регион", re.I))
         if region_elem:
             parent = region_elem.find_parent("div", class_="col-6")
@@ -618,8 +871,8 @@ class DetailedParser:
 
         text = soup.get_text()
         region_patterns = [
-            r"Регион\s*[:\-]\s*([^\n]+)",
-            r"Место нахождения[^\n]*\n([^\n]+)",
+            r"Регион\s*[:\-]\s*([^]+)",
+            r"Место нахождения[^]*([^]+)",
         ]
         for pattern in region_patterns:
             match = re.search(pattern, text, re.IGNORECASE)
@@ -630,22 +883,50 @@ class DetailedParser:
 
     def _extract_title(self, soup: BeautifulSoup) -> str:
         """Извлекает название тендера."""
+        # v6.8.6: Пробуем несколько селекторов
+        # 1. Ссылка с номером закупки
         title_elem = soup.find("span", class_="cardMainInfo__purchaseLink")
         if title_elem:
             return title_elem.get_text(strip=True)
 
-        obj_block = soup.find("div", class_="registry-entry__body-block")
-        if obj_block:
-            title_elem = obj_block.find("div", class_="registry-entry__body-title")
-            if title_elem and "объект" in title_elem.get_text().lower():
-                obj_value = obj_block.find("div", class_="registry-entry__body-value")
-                if obj_value:
-                    return obj_value.get_text(strip=True)
+        # 2. Объект закупки (для 44-ФЗ)
+        obj_section = soup.find("div", class_="cardMainInfo__section")
+        if obj_section:
+            title_elem = obj_section.find("span", class_="cardMainInfo__content")
+            if title_elem:
+                return title_elem.get_text(strip=True)
+
+        # 3. Из section "Наименование объекта закупки"
+        for section in soup.find_all("section", class_="blockInfo__section"):
+            title_span = section.find("span", class_="section__title")
+            if title_span and "объект закупки" in title_span.get_text().lower():
+                content = section.find("span", class_="section__info")
+                if content:
+                    return content.get_text(strip=True)
+
+        # 4. Из таблицы КТРУ
+        ktru_table = soup.find("div", id="purchaseObjectTruTable1")
+        if ktru_table:
+            name_cell = ktru_table.find("td", string=re.compile("Наименование товара"))
+            if name_cell:
+                next_cell = name_cell.find_next("td")
+                if next_cell:
+                    return next_cell.get_text(strip=True)
 
         return ""
 
     def _extract_customer(self, soup: BeautifulSoup) -> str:
         """Извлекает заказчика."""
+        # v6.8.6: Ищем в контактной информации
+        for section in soup.find_all("section", class_="blockInfo__section"):
+            title_span = section.find("span", class_="section__title")
+            if title_span and "организация, осуществляющая размещение" in title_span.get_text().lower():
+                content = section.find("span", class_="section__info")
+                if content:
+                    # Убираем ссылки, оставляем только текст
+                    return content.get_text(strip=True)
+
+        # Fallback: старые селекторы
         customer_elem = soup.find("span", string=re.compile("Заказчик", re.I))
         if customer_elem:
             parent = customer_elem.find_parent("div", class_="col-6")
@@ -666,6 +947,20 @@ class DetailedParser:
 
     def _extract_etp(self, soup: BeautifulSoup) -> str:
         """Извлекает ЭТП."""
+        # v6.8.6: Ищем в секции с "площадк" в заголовке
+        for section in soup.find_all("section", class_="blockInfo__section"):
+            title_span = section.find("span", class_="section__title")
+            if title_span:
+                title_text = title_span.get_text(strip=True).lower()
+                # Проверяем часть слова "площадк" (площадка, площадки)
+                if "площадк" in title_text and "электронн" in title_text:
+                    content = section.find("span", class_="section__info")
+                    if content:
+                        etp = content.get_text(strip=True)
+                        logger.info(f"    [ETP] Извлечен: {etp}")
+                        return etp
+
+        # Fallback: старые селекторы
         etp_elem = soup.find("span", string=re.compile("Электронная площадка", re.I))
         if etp_elem:
             parent = etp_elem.find_parent("div", class_="col-6")
@@ -674,7 +969,6 @@ class DetailedParser:
                 if value:
                     return value.get_text(strip=True)
         return ""
-
     def _extract_nmck(self, soup: BeautifulSoup) -> float:
         """Извлекает НМЦК."""
         nmck_elem = soup.find("span", class_="cardMainInfo__content_cost")
@@ -757,3 +1051,27 @@ class DetailedParser:
                     if name and link:
                         documents.append({"name": name, "link": link})
         return documents
+
+    def _extract_rm_from_ktru(self, soup: BeautifulSoup) -> int:
+        """Извлекает количество РМ из таблицы КТРУ."""
+        ktru_table = soup.find("div", id="purchaseObjectTruTable1")
+        if not ktru_table:
+            return 0
+
+        # Ищем строку с единицей измерения "Рабочее место"
+        for row in ktru_table.find_all("tr", class_="tableBlock__row"):
+            cells = row.find_all("td", class_="tableBlock__col")
+            for i, cell in enumerate(cells):
+                if "рабочее место" in cell.get_text().lower():
+                    # Количество обычно в соседней ячейке
+                    if i + 1 < len(cells):
+                        qty_text = cells[i + 1].get_text(strip=True)
+                        qty_match = re.search(r"[\d\s]+", qty_text)
+                        if qty_match:
+                            try:
+                                qty = int(qty_match.group().replace(" ", "").replace("&nbsp;", ""))
+                                logger.info(f"    [KTRU] РМ из таблицы: {qty}")
+                                return qty
+                            except ValueError:
+                                pass
+        return 0
