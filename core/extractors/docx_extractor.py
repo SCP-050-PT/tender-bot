@@ -91,6 +91,34 @@ class DocxExtractor(BaseExtractor):
         """Fallback для старых .doc файлов (OLE format)."""
         text = ""
 
+        # Попытка 0: pywin32 COM (Windows + Word установлен)
+        try:
+            import win32com.client
+
+            word = win32com.client.Dispatch("Word.Application")
+            word.Visible = False
+            doc = word.Documents.Open(str(file_path.resolve()))
+            text = doc.Content.Text
+            doc.Close(False)
+            word.Quit()
+            if text and len(text.strip()) > 50:
+                logger.info(f"[DocxExtractor v6.9.3] pywin32 COM: {len(text)} симв.")
+                return text
+        except Exception as e:
+            logger.debug(f"[DocxExtractor] pywin32 COM ошибка: {e}")
+
+        # Попытка 1: antiword
+        try:
+            result = subprocess.run(
+                ["antiword", str(file_path)], capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                text = result.stdout
+                logger.info(f"[DocxExtractor v6.9.0] antiword: {len(text)} симв.")
+                return text
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
         # Попытка 1: antiword
         try:
             result = subprocess.run(

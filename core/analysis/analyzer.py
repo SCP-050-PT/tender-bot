@@ -35,6 +35,28 @@ from core.analysis.result import AnalysisResult
 from core.analysis.type_resolver import TypeResolver
 from core.analysis.guard_engine import GuardEngine
 from core.analysis.calculator_router import CalculatorRouter
+from config.prompts import load_system_prompt
+import re as _re
+
+
+def _get_section_from_prompt(prompt_text: str, section_name: str) -> str:
+    """Извлекает секцию из system_prompt.txt по имени.
+
+    Args:
+        prompt_text: полный текст промпта
+        section_name: имя секции без '===', например 'EXTRACT_EDUCATION'
+
+    Returns:
+        Текст секции или пустая строка если не найдена
+    """
+    pattern = _re.compile(
+        rf"===\s*{section_name}\s*===(.*?)(?====\s*\w+\s*===|\Z)",
+        _re.DOTALL | _re.IGNORECASE,
+    )
+    match = pattern.search(prompt_text)
+    if match:
+        return match.group(1).strip()
+    return ""
 
 
 class TenderAnalyzer:
@@ -358,10 +380,165 @@ class TenderAnalyzer:
             else:
                 extracted = self._parse_json(str(response))
 
+            # Записываем ВСЁ из LLM-ответа в tender_info
             for key, value in extracted.items():
                 if value is not None and tender_info.get(key) is None:
                     tender_info[key] = value
                     logger.info(f"[{self.VERSION}] Извлечено: {key}={value}")
+
+            # === v6.9.3: Если programs[] есть, но students_count нет → вычисляем из НМЦК ===
+            if (
+                tender_type == "education"
+                and tender_info.get("programs")
+                and not tender_info.get("students_count")
+            ):
+
+                nmck = tender_info.get("nmck", 0)
+                total_unit_sum = tender_info.get("total_unit_price_sum")
+
+                if total_unit_sum and total_unit_sum > 0 and nmck > 0:
+                    estimated = int(round(nmck / total_unit_sum))
+                else:
+                    estimated = int(round(nmck / 2500)) if nmck > 0 else 0
+
+                if estimated > 0:
+                    tender_info["students_count"] = estimated
+                    tender_info["estimated_students"] = estimated
+
+                    # Устанавливаем protocols_count для Guard в калькуляторе
+                    protocol_programs = [
+                        p
+                        for p in tender_info["programs"]
+                        if p.get("doc_type") == "protocol"
+                    ]
+                    if protocol_programs and not tender_info.get("protocols_count"):
+                        tender_info["protocols_count"] = estimated
+
+                    # Срок договора
+                    contract_end = tender_info.get("contract_end_date")
+                    if contract_end and not tender_info.get("contract_months"):
+                        try:
+                            from datetime import datetime
+
+                            end_date = datetime.strptime(str(contract_end), "%Y-%m-%d")
+                            now = datetime.now()
+                            months = max(
+                                1,
+                                (end_date.year - now.year) * 12
+                                + end_date.month
+                                - now.month,
+                            )
+                            tender_info["contract_months"] = months
+                            tender_info["delivery_count"] = months
+                        except Exception as e:
+                            logger.debug(
+                                f"[{self.VERSION}] Ошибка парсинга contract_end_date: {e}"
+                            )
+
+                    logger.info(
+                        f"[{self.VERSION}] Programs→scalar: "
+                        f"estimated_students={estimated}, "
+                        f"total_unit_sum={total_unit_sum}, "
+                        f"programs_count={len(tender_info['programs'])}, "
+                        f"contract_months={tender_info.get('contract_months')}"
+                    )
+
+            # === v6.9.3: Regex-извлечение total_unit_price_sum из ПОЛНОГО текста ===
+            if (tender_type == "education"
+                    and not tender_info.get("total_unit_price_sum")):
+                import re
+                patterns = [
+                    r'сумм[аы]\s+цен\s+единиц[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
+                    r'начальная.*?сумма\s+цен\s+единиц[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
+                    r'сумма\s+цен\s+единиц\s+(?:услуг|ТРУ)[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, documents_text, re.IGNORECASE)
+                    if match:
+                        try:
+                            val_str = match.group(1).replace(' ', '').replace(',', '.')
+                            val = float(val_str)
+                            if 100 < val < 1_000_000:
+                                tender_info["total_unit_price_sum"] = val
+                                logger.info(
+                                    f"[{self.VERSION}] Regex: total_unit_price_sum={val}"
+                                )
+                                break
+                        except ValueError:
+                            continue
+            # === v6.9.3: Fallback СОУТ — оценка rm_total по НМЦК ===
+            if tender_type == "sout" and not tender_info.get("rm_total"):
+
+                nmck = tender_info.get("nmck", 0)
+                # Средняя рыночная цена за 1 РМ СОУТ ≈ 1000-1200 ₽
+                avg_price_per_rm = 1200
+                estimated_rm = int(round(nmck / avg_price_per_rm)) if nmck > 0 else 0
+
+                if estimated_rm > 0:
+                    tender_info["rm_total"] = estimated_rm
+                    tender_info["rm_total_source"] = "nmck_estimate"
+                    logger.info(
+                        f"[{self.VERSION}] FALLBACK sout: "
+                        f"estimated_rm={estimated_rm} "
+                        f"(НМЦК {nmck:,.0f} / {avg_price_per_rm})"
+                    )
+            # === v6.9.3: Fallback ПЛК — оценка measurement_points по НМЦК ===
+            if tender_type == "plk" and not tender_info.get("measurement_points"):
+
+                nmck = tender_info.get("nmck", 0)
+                # Средняя рыночная цена за 1 точку ПЛК ≈ 150-200 ₽
+                avg_price_per_point = 170
+                estimated_points = (
+                    int(round(nmck / avg_price_per_point)) if nmck > 0 else 0
+                )
+
+                if estimated_points > 0:
+                    tender_info["measurement_points"] = estimated_points
+                    tender_info["measurement_points_source"] = "nmck_estimate"
+                    logger.info(
+                        f"[{self.VERSION}] FALLBACK plk: "
+                        f"estimated_points={estimated_points} "
+                        f"(НМЦК {nmck:,.0f} / {avg_price_per_point})"
+                    )
+            # === FALLBACK v6.9.3: Рамочный договор education без programs[] ===
+            if (tender_type == "education"
+                    and tender_info.get("is_framework_contract") is True
+                    and not tender_info.get("programs")):
+
+                nmck = tender_info.get("nmck", 0)
+                total_unit_sum = tender_info.get("total_unit_price_sum")
+
+                # Оцениваем количество слушателей
+                if total_unit_sum and total_unit_sum > 0:
+                    estimated = int(round(nmck / total_unit_sum))
+                else:
+                    estimated = int(round(nmck / 2500)) if nmck > 0 else 0
+
+                if estimated > 0:
+                    tender_info["students_count"] = estimated
+                    tender_info["estimated_students"] = estimated
+                    if not tender_info.get("protocols_count"):
+                        tender_info["protocols_count"] = estimated
+
+                    contract_end = tender_info.get("contract_end_date")
+                    if contract_end and not tender_info.get("contract_months"):
+                        try:
+                            from datetime import datetime
+                            end_date = datetime.strptime(str(contract_end), "%Y-%m-%d")
+                            now = datetime.now()
+                            months = max(1, (end_date.year - now.year) * 12 + end_date.month - now.month)
+                            tender_info["contract_months"] = months
+                            tender_info["delivery_count"] = months
+                        except Exception as e:
+                            logger.debug(f"[{self.VERSION}] Ошибка парсинга contract_end_date: {e}")
+
+                    logger.info(
+                        f"[{self.VERSION}] FALLBACK education framework: "
+                        f"estimated_students={estimated}, "
+                        f"total_unit_sum={total_unit_sum}, "
+                        f"contract_months={tender_info.get('contract_months')}, "
+                        f"delivery_count={tender_info.get('delivery_count')}"
+                    )
 
         except Exception as e:
             logger.error(f"[{self.VERSION}] Ошибка LLM-извлечения: {e}")
@@ -370,7 +547,9 @@ class TenderAnalyzer:
         if tender_type == "sout":
             return bool(info.get("rm_total") and info["rm_total"] > 0)
         elif tender_type == "education":
-            return bool(info.get("students_count") and info["students_count"] > 0)
+            has_scalar = bool(info.get("students_count") and info["students_count"] > 0)
+            has_programs = bool(info.get("programs") and len(info["programs"]) > 0)
+            return has_scalar or has_programs
         elif tender_type == "opr":
             has_opr = bool(info.get("opr_positions") and info["opr_positions"] > 0)
             has_rm = bool(info.get("rm_total") and info["rm_total"] > 0)
@@ -391,40 +570,75 @@ class TenderAnalyzer:
         return False
 
     def _build_extraction_prompt(self, tender_type: str, documents_text: str) -> str:
-        """Строит тип-специфичный промпт для LLM-извлечения."""
+        """Строит промпт для LLM-извлечения параметров.
+        
+        v6.9.3: Читает секцию из system_prompt.txt вместо хардкода.
+        Устраняет дублирование промптов.
+        """
+        # Маппинг типа тендера → имя секции в system_prompt.txt
+        section_map = {
+            "sout": "EXTRACT_SOUT",
+            "education": "EXTRACT_EDUCATION",
+            "opr": "EXTRACT_OPR",
+            "plk": "EXTRACT_PLK",
+        }
+
+        section_name = section_map.get(tender_type)
+        if not section_name:
+            logger.warning(
+                f"[{self.VERSION}] Нет секции для типа '{tender_type}', "
+                f"используем fallback"
+            )
+            return self._build_fallback_extraction_prompt(tender_type, documents_text)
+
+        # Загружаем системный промпт и извлекаем нужную секцию
+        try:
+            full_prompt = load_system_prompt()
+            section_text = _get_section_from_prompt(full_prompt, section_name)
+
+            if section_text:
+                logger.info(
+                    f"[{self.VERSION}] Используем секцию {section_name} "
+                    f"из system_prompt.txt ({len(section_text)} симв.)"
+                )
+                # v6.9.3: Для education нужно больше текста (таблицы цен в конце документов)
+                text_limit = 30000 if tender_type == "education" else 15000
+                parts = [
+                    section_text,
+                    "",
+                    f"Текст тендера:\n{documents_text[:text_limit]}",
+                    "Верни результат в формате JSON.",
+                ]
+                return "\n".join(parts)
+            else:
+                logger.warning(
+                    f"[{self.VERSION}] Секция {section_name} не найдена "
+                    f"в system_prompt.txt, используем fallback"
+                )
+        except Exception as e:
+            logger.error(
+                f"[{self.VERSION}] Ошибка загрузки system_prompt.txt: {e}, "
+                f"используем fallback"
+            )
+
+        return self._build_fallback_extraction_prompt(tender_type, documents_text)
+
+    def _build_fallback_extraction_prompt(self, tender_type: str, documents_text: str) -> str:
+        """Fallback промпт если system_prompt.txt недоступен."""
+        type_prompts = {
+            "sout": "- rm_total: количество рабочих мест (число)\n- variant: вариант расчёта (1, 2, 3)\n- addresses_count: количество адресов (число)\n- has_iii: есть ли вредные факторы 3-4 класса (true/false)",
+            "education": "- students_count: количество слушателей (число)\n- protocols_count: количество протоколов (число)\n- qual_certs: удостоверений о повышении квалификации (число)\n- is_distance: дистанционное обучение (true/false)\n- teacher_days: дней преподавателя (число)",
+            "opr": "- opr_positions: количество должностей (число)\n- opr_persons: количество работников (число)",
+            "plk": "- measurement_points: количество точек замера (число)\n- measurement_types: типы замеров (список)",
+        }
+
         parts = [
             f"Тендер типа: {tender_type}",
             "Извлеки ТОЛЬКО параметры для этого типа:",
+            type_prompts.get(tender_type, ""),
+            f"Текст тендера:\n{documents_text[:15000]}",
+            "Верни результат в формате JSON.",
         ]
-
-        type_prompts = {
-            "sout": (
-                "- rm_total: количество рабочих мест (число)\n"
-                "- variant: вариант расчёта (1, 2, 3)\n"
-                "- addresses_count: количество адресов (число)\n"
-                "- has_iii: есть ли вредные факторы 3-4 класса (true/false)"
-            ),
-            "education": (
-                "- students_count: количество слушателей (число)\n"
-                "- protocols_count: количество протоколов (число)\n"
-                "- qual_certs: удостоверений о повышении квалификации (число)\n"
-                "- is_distance: дистанционное обучение (true/false)\n"
-                "- teacher_days: дней преподавателя (число)"
-            ),
-            "opr": (
-                "- opr_positions: количество должностей (число)\n"
-                "- opr_persons: количество работников (число)"
-            ),
-            "plk": (
-                "- measurement_points: количество точек замера (число)\n"
-                "- measurement_types: типы замеров (список)"
-            ),
-        }
-
-        parts.append(type_prompts.get(tender_type, ""))
-        parts.append(
-            f"Текст тендера:\n{documents_text[:15000]}\nВерни результат в формате JSON."
-        )
         return "\n".join(parts)
 
     def _parse_json(self, text: str) -> Dict[str, Any]:
