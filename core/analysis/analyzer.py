@@ -1,24 +1,8 @@
 """
 core/analysis/analyzer.py
 Фасад для анализа тендеров.
-
-ИСПРАВЛЕНО (v6.9.0):
-- Добавлен расчёт глобальных затрат (ЭТП, обеспечение, специалист, срочность)
-- _build_comment расширен: ЭТП, обеспечение, специалист, срочность
-- ЭТП определяется по platform_name с fallback mapping
-
-ИСПРАВЛЕНО (v6.9.1):
-- Добавлен вызов apply_global_limits() после расчёта
-- Guard'ы: min_contract_sum, min_margin_percent, max_cost_to_nmck_ratio
-- Violations добавляются в comment и review_reason
-
-ИСПРАВЛЕНО (v6.9.2):
-- FIX: _apply_extra_costs() теперь правильно добавляет global_costs к base cost_price
-  (раньше: result.cost_price = extra["total_extra"] → теперь: +=)
-- FIX: Guard 4 фантомных students_count теперь проверяет source, не только confidence
-- FIX: min_margin_percent guard использует round(margin, 2) >= min_margin
-- FIX: margin > 200% не срабатывает при limit_applied (цена поднята лимитом)
-- FIX: cost/НМЦК guard: порог 0.85 → 0.90 для тендеров > 100K
+v7.0.0: Рефакторинг — делегирование сервисам TypeService, LlmService, FallbackService.
+Убраны дубли: _build_extraction_prompt, _parse_json, FALLBACK-блоки.
 """
 
 import json
@@ -32,37 +16,19 @@ from core.tender_type import TenderTypeDetector
 from utils.llm_client import YandexGPTClient
 from core.calculation.calculation_result import CalculationResult
 from core.analysis.result import AnalysisResult
-from core.analysis.type_resolver import TypeResolver
 from core.analysis.guard_engine import GuardEngine
 from core.analysis.calculator_router import CalculatorRouter
-from config.prompts import load_system_prompt
-import re as _re
 
-
-def _get_section_from_prompt(prompt_text: str, section_name: str) -> str:
-    """Извлекает секцию из system_prompt.txt по имени.
-
-    Args:
-        prompt_text: полный текст промпта
-        section_name: имя секции без '===', например 'EXTRACT_EDUCATION'
-
-    Returns:
-        Текст секции или пустая строка если не найдена
-    """
-    pattern = _re.compile(
-        rf"===\s*{section_name}\s*===(.*?)(?====\s*\w+\s*===|\Z)",
-        _re.DOTALL | _re.IGNORECASE,
-    )
-    match = pattern.search(prompt_text)
-    if match:
-        return match.group(1).strip()
-    return ""
+# v7.0.0: Единые сервисы вместо дублей
+from core.services.type_service import TypeService
+from core.services.llm_service import LlmService
+from core.services.fallback_service import FallbackService
 
 
 class TenderAnalyzer:
-    """Фасад для анализа тендеров."""
+    """Фасад для анализа тендеров. v7.0.0: оркестрация через сервисы."""
 
-    VERSION = "v6.9.2"
+    VERSION = "v7.0.0"
 
     # Mapping ЭТП → комиссия (%)
     ETP_COMMISSION_RATES = {
@@ -86,10 +52,12 @@ class TenderAnalyzer:
     ):
         self.calculator = calculator
         self.risk_analyzer = risk_analyzer
-        self.type_resolver = TypeResolver()
+        # v7.0.0: Сервисы вместо дублей
+        self.type_service = TypeService()
+        self.llm_service = LlmService(llm_client or YandexGPTClient())
+        self.fallback_service = FallbackService()
         self.guard_engine = GuardEngine()
         self.calculator_router = CalculatorRouter(calculator)
-        self.llm_client = llm_client or YandexGPTClient()
         logger.info(f"TenderAnalyzer инициализирован ({self.VERSION})")
 
     def analyze(
@@ -103,8 +71,8 @@ class TenderAnalyzer:
         """Анализирует тендер полностью."""
         logger.info(f"[{self.VERSION}] Начинаю анализ тендера")
 
-        # Шаг 1: Определение типа
-        tender_type, type_source, method = self.type_resolver.resolve(
+        # Шаг 1: Определение типа (через TypeService)
+        tender_type, type_source, method = self.type_service.resolve(
             tender_info=tender_info,
             documents_text=documents_text,
             llm_classification=llm_classification,
@@ -115,17 +83,17 @@ class TenderAnalyzer:
         # Шаг 2: Guard'ы
         tender_info, guards = self.guard_engine.apply(tender_info, tender_type)
 
-        # Шаг 3: Извлечение параметров через LLM
+        # Шаг 3: Извлечение параметров через LLM (через LlmService)
         self._extract_if_needed(tender_info, documents_text, tender_type)
 
-        # Шаг 3.5: Глобальные затраты (v6.9.0)
+        # Шаг 3.5: Fallback-оценки по НМЦК (через FallbackService)
+        self.fallback_service.apply(tender_info, tender_type)
+
+        # Шаг 4: Глобальные затраты (ЭТП, обеспечение, специалист, срочность)
         nmck = tender_info.get("nmck", 0)
         deadline_days = tender_info.get("deadline_days", 30)
 
-        # ЭТП комиссия
         etp_commission = self._resolve_etp_commission(tender_info)
-
-        # Обеспечение
         app_guarantee = self._parse_guarantee_percent(
             tender_info.get("application_guarantee", "")
         )
@@ -141,15 +109,15 @@ class TenderAnalyzer:
             deadline_days=deadline_days,
         )
 
-        # Шаг 4: Расчёт БАЗОВОЙ себестоимости (education/sout/opr/plk)
+        # Шаг 5: Расчёт БАЗОВОЙ себестоимости
         base_result = self.calculator_router.calculate(
             tender_info, tender_type, documents_text
         )
 
-        # v6.9.2 FIX: Применяем глобальные затраты К базовой себестоимости, не ЗАМЕНЯЕМ
+        # Применяем глобальные затраты К базовой себестоимости
         result = self._apply_extra_costs(base_result, extra_costs)
 
-        # === ШАГ 4.5: ГЛОБАЛЬНЫЕ ЛИМИТЫ / GUARD'Ы (v6.9.1) ===
+        # Шаг 6: Глобальные лимиты / Guard'ы
         limits_result = self.calculator.apply_global_limits(
             cost_price=result.cost_price,
             recommended_price=result.recommended_price,
@@ -157,7 +125,6 @@ class TenderAnalyzer:
             tender_type=tender_type,
         )
 
-        # Если лимиты нарушены — корректируем результат
         if not limits_result["is_valid"]:
             logger.warning(
                 f"[{self.VERSION}] GUARD: обнаружены нарушения лимитов: "
@@ -172,8 +139,9 @@ class TenderAnalyzer:
                 transport_cost=result.transport_cost,
                 subcontractor_cost=result.subcontractor_cost,
                 guarantee_cost=result.guarantee_cost,
-                needs_manual_review=result.needs_manual_review
-                or limits_result["needs_manual_review"],
+                needs_manual_review=(
+                    result.needs_manual_review or limits_result["needs_manual_review"]
+                ),
                 review_reason=self._merge_review_reasons(
                     result.review_reason,
                     limits_result["review_reason"],
@@ -183,11 +151,11 @@ class TenderAnalyzer:
                     **(result.details or {}),
                     "global_limits_violations": limits_result["violations"],
                     "original_recommended_price": old_price,
-                    "limit_applied": True,  # v6.9.2: флаг для risk_rules
+                    "limit_applied": True,
                 },
             )
 
-        # Шаг 5: Анализ рисков
+        # Шаг 7: Анализ рисков
         deadline_days = tender_info.get("deadline_days")
         if deadline_days is None or (
             isinstance(deadline_days, (int, float)) and deadline_days <= 0
@@ -197,7 +165,6 @@ class TenderAnalyzer:
                 f"[{self.VERSION}] deadline_days не указан, используем дефолт 30"
             )
 
-        # v6.9.2: Передаём limit_applied в risk_analyzer
         risk_result = self.risk_analyzer.analyze(
             tender_type=tender_type,
             nmck=nmck,
@@ -214,11 +181,15 @@ class TenderAnalyzer:
         limits_risk = limits_result.get("risk_level", "low")
         if limits_risk == "high" and risk_result.get("risk_level") != "high":
             risk_result["risk_level"] = "high"
+            max_ratio = self.calculator.costs.get("global_limits", {}).get(
+                "max_cost_to_nmck_ratio", 0.85
+            )
             risk_result["flags"] = risk_result.get("flags", []) + [
-                f"Себестоимость составляет >{self.calculator.costs.get('global_limits', {}).get('max_cost_to_nmck_ratio', 0.85)*100:.0f}% от НМЦК — высокий риск убыточности"
+                f"Себестоимость составляет >{max_ratio*100:.0f}% от НМЦК "
+                f"— высокий риск убыточности"
             ]
 
-        # Шаг 6: Комментарий
+        # Шаг 8: Комментарий
         comment = self._build_comment(
             tender_type=tender_type,
             result=result,
@@ -248,7 +219,55 @@ class TenderAnalyzer:
             red_flags=risk_result.get("flags", []),
         )
 
-    # ==================== Утилиты для guard'ов (v6.9.1) ====================
+    # ==================== LLM-извлечение (v7.0.0: делегирует LlmService) ====================
+
+    def _extract_if_needed(
+        self, tender_info: Dict[str, Any], documents_text: str, tender_type: str
+    ) -> None:
+        """Извлекает параметры через LLM если недостаточно данных."""
+        has_params = self._has_sufficient_params(tender_info, tender_type)
+        if has_params:
+            logger.info(
+                f"[{self.VERSION}] Параметров достаточно, LLM-извлечение не требуется"
+            )
+            return
+
+        extracted = self.llm_service.extract_params(tender_type, documents_text)
+        if not extracted:
+            return
+
+        for key, value in extracted.items():
+            if value is not None and tender_info.get(key) is None:
+                tender_info[key] = value
+                logger.info(f"[{self.VERSION}] Извлечено: {key}={value}")
+
+    def _has_sufficient_params(self, info: Dict[str, Any], tender_type: str) -> bool:
+        """Проверяет, достаточно ли параметров для расчёта."""
+        if tender_type == "sout":
+            return bool(info.get("rm_total") and info["rm_total"] > 0)
+        elif tender_type == "education":
+            has_scalar = bool(info.get("students_count") and info["students_count"] > 0)
+            has_programs = bool(info.get("programs") and len(info["programs"]) > 0)
+            return has_scalar or has_programs
+        elif tender_type == "opr":
+            has_opr = bool(info.get("opr_positions") and info["opr_positions"] > 0)
+            has_rm = bool(info.get("rm_total") and info["rm_total"] > 0)
+            has_persons = bool(info.get("opr_persons") and info["opr_persons"] > 0)
+            if has_persons and not has_opr:
+                info["opr_positions"] = info["opr_persons"]
+                has_opr = True
+                logger.info(
+                    f"[{self.VERSION}] Fallback: opr_persons="
+                    f"{info['opr_persons']} → opr_positions"
+                )
+            return has_opr or has_rm
+        elif tender_type == "plk":
+            return bool(
+                info.get("measurement_points") and info["measurement_points"] > 0
+            )
+        return False
+
+    # ==================== Утилиты для guard'ов ====================
 
     def _merge_review_reasons(
         self, existing: str, limits_reason: str, violations: List[str]
@@ -267,20 +286,18 @@ class TenderAnalyzer:
 
     def _resolve_etp_commission(self, tender_info: Dict[str, Any]) -> float:
         """Определяет комиссию ЭТП."""
-        # Явно указана
         etp = tender_info.get("etp_commission_percent", 0)
         if etp > 0:
             return etp
 
-        # Определяем по названию площадки
         platform = tender_info.get("platform_name", "").lower()
         for key, val in self.ETP_COMMISSION_RATES.items():
             if key in platform:
                 logger.info(
-                    f"[{self.VERSION}] ЭТП определена по площадке '{platform}': {val}%"
+                    f"[{self.VERSION}] ЭТП определена по площадке "
+                    f"'{platform}': {val}%"
                 )
                 return val
-
         return 0.0
 
     def _parse_guarantee_percent(self, guarantee_raw: str) -> float:
@@ -298,15 +315,9 @@ class TenderAnalyzer:
     def _apply_extra_costs(
         self, base_result: CalculationResult, extra_costs: dict
     ) -> CalculationResult:
-        """Добавляет глобальные затраты к БАЗОВОЙ себестоимости.
-
-        v6.9.2 FIX: Раньше result.cost_price = total_extra (450₽),
-        теперь result.cost_price = base_result.cost_price + total_extra.
-        """
+        """Добавляет глобальные затраты к БАЗОВОЙ себестоимости."""
         total_extra = extra_costs.get("total_extra", 0)
 
-        # v6.9.2: Если base_result пустой (cost_price=0) — значит не удалось рассчитать
-        # Не добавляем global_costs к нулевой базе
         if base_result.cost_price <= 0:
             logger.warning(
                 f"[{self.VERSION}] Базовая себестоимость = 0, "
@@ -317,11 +328,9 @@ class TenderAnalyzer:
         new_cost = base_result.cost_price + total_extra
         new_recommended = base_result.recommended_price + total_extra
 
-        # Пересчитываем маржу относительно новой себестоимости
         margin_rub = new_recommended - new_cost
         margin_percent = (margin_rub / new_cost * 100) if new_cost > 0 else 0.0
 
-        # Мержим детали
         details = dict(base_result.details) if base_result.details else {}
         details.update(
             {
@@ -331,7 +340,7 @@ class TenderAnalyzer:
                 "specialist_cost": extra_costs.get("specialist_cost", 0),
                 "urgency_multiplier": extra_costs.get("urgency_multiplier", 1.0),
                 "urgency_note": extra_costs.get("urgency_note", ""),
-                "base_cost_price": base_result.cost_price,  # v6.9.2: для отладки
+                "base_cost_price": base_result.cost_price,
                 "global_costs_total": total_extra,
             }
         )
@@ -348,327 +357,6 @@ class TenderAnalyzer:
             review_reason=base_result.review_reason,
             details=details,
         )
-
-    # ==================== LLM-извлечение параметров ====================
-
-    def _extract_if_needed(
-        self, tender_info: Dict[str, Any], documents_text: str, tender_type: str
-    ) -> None:
-        """Извлекает параметры через LLM если недостаточно данных."""
-        has_params = self._has_sufficient_params(tender_info, tender_type)
-        if has_params:
-            logger.info(
-                f"[{self.VERSION}] Параметров достаточно, LLM-извлечение не требуется"
-            )
-            return
-
-        prompt = self._build_extraction_prompt(tender_type, documents_text)
-        try:
-            response = self.llm_client.send(
-                system_prompt="Ты — аналитик тендеров. Извлеки параметры из текста и верни JSON.",
-                user_message=prompt,
-                temperature=0.1,
-                max_tokens=2000,
-            )
-            raw_text_for_debug = str(response)
-            logger.debug(f"[LLM RAW] {raw_text_for_debug[:2000]}")
-
-            if isinstance(response, dict) and "raw_text" in response:
-                extracted = self._parse_json(response["raw_text"])
-            elif isinstance(response, dict):
-                extracted = response
-            else:
-                extracted = self._parse_json(str(response))
-
-            # Записываем ВСЁ из LLM-ответа в tender_info
-            for key, value in extracted.items():
-                if value is not None and tender_info.get(key) is None:
-                    tender_info[key] = value
-                    logger.info(f"[{self.VERSION}] Извлечено: {key}={value}")
-
-            # === v6.9.3: Если programs[] есть, но students_count нет → вычисляем из НМЦК ===
-            if (
-                tender_type == "education"
-                and tender_info.get("programs")
-                and not tender_info.get("students_count")
-            ):
-
-                nmck = tender_info.get("nmck", 0)
-                total_unit_sum = tender_info.get("total_unit_price_sum")
-
-                if total_unit_sum and total_unit_sum > 0 and nmck > 0:
-                    estimated = int(round(nmck / total_unit_sum))
-                else:
-                    estimated = int(round(nmck / 2500)) if nmck > 0 else 0
-
-                if estimated > 0:
-                    tender_info["students_count"] = estimated
-                    tender_info["estimated_students"] = estimated
-
-                    # Устанавливаем protocols_count для Guard в калькуляторе
-                    protocol_programs = [
-                        p
-                        for p in tender_info["programs"]
-                        if p.get("doc_type") == "protocol"
-                    ]
-                    if protocol_programs and not tender_info.get("protocols_count"):
-                        tender_info["protocols_count"] = estimated
-
-                    # Срок договора
-                    contract_end = tender_info.get("contract_end_date")
-                    if contract_end and not tender_info.get("contract_months"):
-                        try:
-                            from datetime import datetime
-
-                            end_date = datetime.strptime(str(contract_end), "%Y-%m-%d")
-                            now = datetime.now()
-                            months = max(
-                                1,
-                                (end_date.year - now.year) * 12
-                                + end_date.month
-                                - now.month,
-                            )
-                            tender_info["contract_months"] = months
-                            tender_info["delivery_count"] = months
-                        except Exception as e:
-                            logger.debug(
-                                f"[{self.VERSION}] Ошибка парсинга contract_end_date: {e}"
-                            )
-
-                    logger.info(
-                        f"[{self.VERSION}] Programs→scalar: "
-                        f"estimated_students={estimated}, "
-                        f"total_unit_sum={total_unit_sum}, "
-                        f"programs_count={len(tender_info['programs'])}, "
-                        f"contract_months={tender_info.get('contract_months')}"
-                    )
-
-            # === v6.9.3: Regex-извлечение total_unit_price_sum из ПОЛНОГО текста ===
-            if (tender_type == "education"
-                    and not tender_info.get("total_unit_price_sum")):
-                import re
-                patterns = [
-                    r'сумм[аы]\s+цен\s+единиц[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
-                    r'начальная.*?сумма\s+цен\s+единиц[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
-                    r'сумма\s+цен\s+единиц\s+(?:услуг|ТРУ)[^0-9]*?([0-9]+[\s.,]*[0-9]*)',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, documents_text, re.IGNORECASE)
-                    if match:
-                        try:
-                            val_str = match.group(1).replace(' ', '').replace(',', '.')
-                            val = float(val_str)
-                            if 100 < val < 1_000_000:
-                                tender_info["total_unit_price_sum"] = val
-                                logger.info(
-                                    f"[{self.VERSION}] Regex: total_unit_price_sum={val}"
-                                )
-                                break
-                        except ValueError:
-                            continue
-            # === v6.9.3: Fallback СОУТ — оценка rm_total по НМЦК ===
-            if tender_type == "sout" and not tender_info.get("rm_total"):
-
-                nmck = tender_info.get("nmck", 0)
-                # Средняя рыночная цена за 1 РМ СОУТ ≈ 1000-1200 ₽
-                avg_price_per_rm = 1200
-                estimated_rm = int(round(nmck / avg_price_per_rm)) if nmck > 0 else 0
-
-                if estimated_rm > 0:
-                    tender_info["rm_total"] = estimated_rm
-                    tender_info["rm_total_source"] = "nmck_estimate"
-                    logger.info(
-                        f"[{self.VERSION}] FALLBACK sout: "
-                        f"estimated_rm={estimated_rm} "
-                        f"(НМЦК {nmck:,.0f} / {avg_price_per_rm})"
-                    )
-            # === v6.9.3: Fallback ПЛК — оценка measurement_points по НМЦК ===
-            if tender_type == "plk" and not tender_info.get("measurement_points"):
-
-                nmck = tender_info.get("nmck", 0)
-                # Средняя рыночная цена за 1 точку ПЛК ≈ 150-200 ₽
-                avg_price_per_point = 170
-                estimated_points = (
-                    int(round(nmck / avg_price_per_point)) if nmck > 0 else 0
-                )
-
-                if estimated_points > 0:
-                    tender_info["measurement_points"] = estimated_points
-                    tender_info["measurement_points_source"] = "nmck_estimate"
-                    logger.info(
-                        f"[{self.VERSION}] FALLBACK plk: "
-                        f"estimated_points={estimated_points} "
-                        f"(НМЦК {nmck:,.0f} / {avg_price_per_point})"
-                    )
-            # === FALLBACK v6.9.3: Рамочный договор education без programs[] ===
-            if (tender_type == "education"
-                    and tender_info.get("is_framework_contract") is True
-                    and not tender_info.get("programs")):
-
-                nmck = tender_info.get("nmck", 0)
-                total_unit_sum = tender_info.get("total_unit_price_sum")
-
-                # Оцениваем количество слушателей
-                if total_unit_sum and total_unit_sum > 0:
-                    estimated = int(round(nmck / total_unit_sum))
-                else:
-                    estimated = int(round(nmck / 2500)) if nmck > 0 else 0
-
-                if estimated > 0:
-                    tender_info["students_count"] = estimated
-                    tender_info["estimated_students"] = estimated
-                    if not tender_info.get("protocols_count"):
-                        tender_info["protocols_count"] = estimated
-
-                    contract_end = tender_info.get("contract_end_date")
-                    if contract_end and not tender_info.get("contract_months"):
-                        try:
-                            from datetime import datetime
-                            end_date = datetime.strptime(str(contract_end), "%Y-%m-%d")
-                            now = datetime.now()
-                            months = max(1, (end_date.year - now.year) * 12 + end_date.month - now.month)
-                            tender_info["contract_months"] = months
-                            tender_info["delivery_count"] = months
-                        except Exception as e:
-                            logger.debug(f"[{self.VERSION}] Ошибка парсинга contract_end_date: {e}")
-
-                    logger.info(
-                        f"[{self.VERSION}] FALLBACK education framework: "
-                        f"estimated_students={estimated}, "
-                        f"total_unit_sum={total_unit_sum}, "
-                        f"contract_months={tender_info.get('contract_months')}, "
-                        f"delivery_count={tender_info.get('delivery_count')}"
-                    )
-
-        except Exception as e:
-            logger.error(f"[{self.VERSION}] Ошибка LLM-извлечения: {e}")
-
-    def _has_sufficient_params(self, info: Dict[str, Any], tender_type: str) -> bool:
-        if tender_type == "sout":
-            return bool(info.get("rm_total") and info["rm_total"] > 0)
-        elif tender_type == "education":
-            has_scalar = bool(info.get("students_count") and info["students_count"] > 0)
-            has_programs = bool(info.get("programs") and len(info["programs"]) > 0)
-            return has_scalar or has_programs
-        elif tender_type == "opr":
-            has_opr = bool(info.get("opr_positions") and info["opr_positions"] > 0)
-            has_rm = bool(info.get("rm_total") and info["rm_total"] > 0)
-            has_persons = bool(info.get("opr_persons") and info["opr_persons"] > 0)
-
-            if has_persons and not has_opr:
-                info["opr_positions"] = info["opr_persons"]
-                has_opr = True
-                logger.info(
-                    f"[{self.VERSION}] Fallback: opr_persons={info['opr_persons']} → opr_positions"
-                )
-
-            return has_opr or has_rm
-        elif tender_type == "plk":
-            return bool(
-                info.get("measurement_points") and info["measurement_points"] > 0
-            )
-        return False
-
-    def _build_extraction_prompt(self, tender_type: str, documents_text: str) -> str:
-        """Строит промпт для LLM-извлечения параметров.
-        
-        v6.9.3: Читает секцию из system_prompt.txt вместо хардкода.
-        Устраняет дублирование промптов.
-        """
-        # Маппинг типа тендера → имя секции в system_prompt.txt
-        section_map = {
-            "sout": "EXTRACT_SOUT",
-            "education": "EXTRACT_EDUCATION",
-            "opr": "EXTRACT_OPR",
-            "plk": "EXTRACT_PLK",
-        }
-
-        section_name = section_map.get(tender_type)
-        if not section_name:
-            logger.warning(
-                f"[{self.VERSION}] Нет секции для типа '{tender_type}', "
-                f"используем fallback"
-            )
-            return self._build_fallback_extraction_prompt(tender_type, documents_text)
-
-        # Загружаем системный промпт и извлекаем нужную секцию
-        try:
-            full_prompt = load_system_prompt()
-            section_text = _get_section_from_prompt(full_prompt, section_name)
-
-            if section_text:
-                logger.info(
-                    f"[{self.VERSION}] Используем секцию {section_name} "
-                    f"из system_prompt.txt ({len(section_text)} симв.)"
-                )
-                # v6.9.3: Для education нужно больше текста (таблицы цен в конце документов)
-                text_limit = 30000 if tender_type == "education" else 15000
-                parts = [
-                    section_text,
-                    "",
-                    f"Текст тендера:\n{documents_text[:text_limit]}",
-                    "Верни результат в формате JSON.",
-                ]
-                return "\n".join(parts)
-            else:
-                logger.warning(
-                    f"[{self.VERSION}] Секция {section_name} не найдена "
-                    f"в system_prompt.txt, используем fallback"
-                )
-        except Exception as e:
-            logger.error(
-                f"[{self.VERSION}] Ошибка загрузки system_prompt.txt: {e}, "
-                f"используем fallback"
-            )
-
-        return self._build_fallback_extraction_prompt(tender_type, documents_text)
-
-    def _build_fallback_extraction_prompt(self, tender_type: str, documents_text: str) -> str:
-        """Fallback промпт если system_prompt.txt недоступен."""
-        type_prompts = {
-            "sout": "- rm_total: количество рабочих мест (число)\n- variant: вариант расчёта (1, 2, 3)\n- addresses_count: количество адресов (число)\n- has_iii: есть ли вредные факторы 3-4 класса (true/false)",
-            "education": "- students_count: количество слушателей (число)\n- protocols_count: количество протоколов (число)\n- qual_certs: удостоверений о повышении квалификации (число)\n- is_distance: дистанционное обучение (true/false)\n- teacher_days: дней преподавателя (число)",
-            "opr": "- opr_positions: количество должностей (число)\n- opr_persons: количество работников (число)",
-            "plk": "- measurement_points: количество точек замера (число)\n- measurement_types: типы замеров (список)",
-        }
-
-        parts = [
-            f"Тендер типа: {tender_type}",
-            "Извлеки ТОЛЬКО параметры для этого типа:",
-            type_prompts.get(tender_type, ""),
-            f"Текст тендера:\n{documents_text[:15000]}",
-            "Верни результат в формате JSON.",
-        ]
-        return "\n".join(parts)
-
-    def _parse_json(self, text: str) -> Dict[str, Any]:
-        """Парсит JSON из текста LLM-ответа."""
-        if not text:
-            return {}
-
-        cleaned = text.strip()
-        cleaned = re.sub(r"^```\w*\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = re.sub(r"```\s*$", "", cleaned)
-        cleaned = re.sub(r"^json\s*", "", cleaned, flags=re.IGNORECASE)
-        cleaned = cleaned.strip()
-
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError:
-            pass
-
-        for pattern in [r"\{[\s\S]*\}", r"\{.*\}"]:
-            match = re.search(pattern, cleaned, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group())
-                except json.JSONDecodeError:
-                    continue
-
-        logger.warning(
-            f"[{self.VERSION}] Не удалось распарсить JSON, пробуем key-value"
-        )
-        return {}
 
     # ==================== Комментарий ====================
 
@@ -699,7 +387,6 @@ class TenderAnalyzer:
             for guard in guards:
                 lines.append(f"  • {guard}")
 
-        # v6.9.0: Глобальные затраты
         if extra_costs:
             lines.append("")
             lines.append("Глобальные затраты:")
@@ -709,11 +396,13 @@ class TenderAnalyzer:
                 )
             if extra_costs.get("application_guarantee", 0) > 0:
                 lines.append(
-                    f"  • Обеспечение заявки (БГ): {extra_costs['application_guarantee']:,.0f} ₽"
+                    f"  • Обеспечение заявки (БГ): "
+                    f"{extra_costs['application_guarantee']:,.0f} ₽"
                 )
             if extra_costs.get("contract_guarantee", 0) > 0:
                 lines.append(
-                    f"  • Обеспечение контракта: {extra_costs['contract_guarantee']:,.0f} ₽"
+                    f"  • Обеспечение контракта (БГ): "
+                    f"{extra_costs['contract_guarantee']:,.0f} ₽"
                 )
             if extra_costs.get("specialist_cost", 0) > 0:
                 lines.append(
@@ -722,17 +411,17 @@ class TenderAnalyzer:
             if extra_costs.get("urgency_note"):
                 lines.append(f"  • {extra_costs['urgency_note']}")
 
-        # v6.9.2: Базовая себестоимость (для отладки)
         if result.details and result.details.get("base_cost_price"):
             lines.append("")
             lines.append(
-                f"  • Базовая себестоимость: {result.details['base_cost_price']:,.0f} ₽"
+                f"  • Базовая себестоимость: "
+                f"{result.details['base_cost_price']:,.0f} ₽"
             )
             lines.append(
-                f"  • Global costs: {result.details.get('global_costs_total', 0):,.0f} ₽"
+                f"  • Global costs: "
+                f"{result.details.get('global_costs_total', 0):,.0f} ₽"
             )
 
-        # v6.9.1: Лимиты / guard'ы
         if limits_result and not limits_result.get("is_valid", True):
             lines.append("")
             lines.append("⚠️ Нарушения глобальных лимитов:")

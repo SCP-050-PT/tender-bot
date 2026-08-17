@@ -380,7 +380,7 @@ class TenderSearcher:
             print(f"⚖️ Закон: {tender.law}")
             print(f"📋 Статус: {tender.status or 'не указан'}")
             print(f"🔗 {tender.url}")
-            print(f"🗺️ Регион: {result.region or 'не определён'}")
+            print(f"🗺️ Регион: {tender.region or 'не определён'}")
             print(f"{'-'*60}")
 
         if output_file and results:
