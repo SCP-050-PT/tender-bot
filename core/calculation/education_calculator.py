@@ -2,11 +2,9 @@
 core/calculation/education_calculator.py
 Расчёт цены для клиента на обучение.
 Вынесено из calculator.py (v6.5).
-ИСПРАВЛЕНО (v6.7.3):
-  - Убран дублирующийся CalculationResult (импорт из calculation_result.py)
-  - Guard для ОТ: принудительно protocols при "охрана труда" в тексте
-  - needs_manual_review прокидывается в CalculationResult
-  - review_reason прокидывается в CalculationResult
+ИСПРАВЛЕНО (v6.9.0):
+  - Аренда помещения = 0 в офисных городах (Екатеринбург, Ижевск, Тюмень, Новосибирск)
+  - Добавлен параметр region
 """
 
 from dataclasses import dataclass
@@ -19,6 +17,9 @@ from core.calculation.calculation_result import CalculationResult
 
 class EducationCalculator:
     """Расчёт цены для клиента на обучение."""
+
+    # Офисные города — аренда не нужна
+    OFFICE_CITIES = ["екатеринбург", "ижевск", "тюмень", "новосибирск"]
 
     def __init__(self):
         self.costs = load_costs()["education"]
@@ -51,12 +52,18 @@ class EducationCalculator:
         review_reason: str = "",
         llm_confidence: float = 0.0,
         tender_text: str = "",
+        region: str = "",
+        is_annual: bool = False,
     ) -> CalculationResult:
         """
         Расчёт цены для клиента на обучение.
-        v6.7.3: Guard для ОТ — принудительно protocols при "охрана труда".
+        v6.9.0: Аренда = 0 в офисных городах.
+        v6.9.1: Годовые тендеры — документы, материалы, труд, доставка ×12
         """
-        # === v6.7.3-fix: Guard для обучения ОТ ===
+
+        # v6.9.1: Годовой множитель
+        annual_mult = 12 if is_annual else 1
+        # === Guard для обучения ОТ ===
         if students_count > 0 and tender_text:
             text_lower = tender_text.lower()
             ot_keywords = [
@@ -73,7 +80,7 @@ class EducationCalculator:
                 and (qual_certs + diplomas + certificates + worker_certs) > 0
             ):
                 logger.warning(
-                    f"[EducationCalc v6.7.3-fix] Обнаружен ОТ, но LLM дал другие документы. "
+                    f"[EducationCalc v6.9.0] Обнаружен ОТ, но LLM дал другие документы. "
                     f"Принудительно protocols={students_count}"
                 )
                 protocols_count = students_count
@@ -87,10 +94,9 @@ class EducationCalculator:
 
         if total_explicit_docs == 0 and students_count > 0:
             auto = True
-            # v6.7.1: При авто-определении и высоком confidence — не требуем review
             if llm_confidence >= 0.5:
                 logger.info(
-                    f"[EducationCalc v6.7.3] Авто-определение при "
+                    f"[EducationCalc v6.9.0] Авто-определение при "
                     f"llm_confidence={llm_confidence:.2f} >= 0.5 — review НЕ требуется"
                 )
                 needs_manual_review = False
@@ -101,7 +107,6 @@ class EducationCalculator:
                     "Требуется ручная проверка ТЗ."
                 )
 
-            # Пытаемся определить по ключевым словам в тексте
             if tender_text:
                 text_lower = tender_text.lower()
                 if any(
@@ -152,7 +157,6 @@ class EducationCalculator:
                         f"[EducationCalc] Авто: повышение квалификации → qual_certs={students_count}"
                     )
                 else:
-                    # По умолчанию — протоколы ОТ (самый частый случай)
                     protocols_count = students_count
                     logger.info(
                         f"[EducationCalc] Авто: тип неясен → protocols_count={students_count} (предполагаем ОТ)"
@@ -171,7 +175,7 @@ class EducationCalculator:
             f"transport_km={transport_km}, venue_days={venue_days}, "
             f"manikin_days={manikin_days}, delivery={delivery_count}, "
             f"auto={auto}, needs_review={needs_manual_review}, "
-            f"llm_confidence={llm_confidence:.2f}"
+            f"llm_confidence={llm_confidence:.2f}, region={region}"
         )
 
         # === Документы ===
@@ -181,27 +185,30 @@ class EducationCalculator:
             + worker_certs * self.docs["certificate_worker"]["cost"]
             + qual_certs * self.docs["certificate_qualification"]["cost"]
             + protocols_count * self.docs["protocol"]["cost"]
-        )
+        ) * annual_mult
 
-        # Материалы (бумага, краска)
+        # Материалы
         total_docs = (
             certificates + diplomas + worker_certs + qual_certs + protocols_count
         )
-        paper_cost = total_docs * self.materials["paper_a4"]["cost"]
-        ink_cost = total_docs * self.materials["ink_per_page"]["cost"]
-        lamination_cost = certificates * self.materials["lamination"]["cost"]
+        paper_cost = total_docs * self.materials["paper_a4"]["cost"] * annual_mult
+        ink_cost = total_docs * self.materials["ink_per_page"]["cost"] * annual_mult
+        lamination_cost = (
+            certificates * self.materials["lamination"]["cost"] * annual_mult
+        )
         materials_cost = paper_cost + ink_cost + lamination_cost
 
         # Доставка
-        delivery_cost = delivery_count * self.delivery["post_russia"]["cost"]
+        actual_delivery = 12 if is_annual else delivery_count
+        delivery_cost = actual_delivery * self.delivery["post_russia"]["cost"]
 
         # Накладные
-        overhead_cost = self.overhead["base"]["cost"]
+        overhead_cost = self.overhead["base"]["cost"] * annual_mult
 
-        # Труд (методист, РО, портал)
-        methodist_cost = self.labor["methodist_hour"]["cost"] * 3
-        ro_cost = self.labor["ro_hour"]["cost"] * 1
-        portal_cost = self.labor["portal_access"]["cost"] * students_count
+        # Труд
+        methodist_cost = self.labor["methodist_hour"]["cost"] * 3 * annual_mult
+        ro_cost = self.labor["ro_hour"]["cost"] * 1 * annual_mult
+        portal_cost = self.labor["portal_access"]["cost"] * students_count * annual_mult
         labor_cost = methodist_cost + ro_cost + portal_cost
 
         # === Очные затраты ===
@@ -219,7 +226,6 @@ class EducationCalculator:
             elif teacher_days > 0:
                 teacher_cost = teacher_days * self.rates["teacher_daily"]["cost"]
             else:
-                # Авто-оценка дней преподавателя
                 auto_teacher_days = max(1, (students_count + 24) // 25)
                 teacher_cost = auto_teacher_days * self.rates["teacher_daily"]["cost"]
                 teacher_days = auto_teacher_days
@@ -258,11 +264,20 @@ class EducationCalculator:
                 teacher_days * self.forms["full_time"]["daily_allowance"]
             )
 
-            # Аренда помещения
-            if venue_days > 0:
-                venue_cost = venue_days * self.rates["venue_daily"]["cost"]
+            # Аренда помещения (v6.9.0: 0 в офисных городах)
+            region_lower = region.lower() if region else ""
+            is_office_city = any(city in region_lower for city in self.OFFICE_CITIES)
+
+            if is_office_city:
+                venue_cost = 0
+                logger.info(
+                    f"[EducationCalc v6.9.0] Аренда = 0 (офисный город: {region})"
+                )
             else:
-                venue_cost = teacher_days * self.rates["venue_daily"]["cost"]
+                if venue_days > 0:
+                    venue_cost = venue_days * self.rates["venue_daily"]["cost"]
+                else:
+                    venue_cost = teacher_days * self.rates["venue_daily"]["cost"]
 
             # Манекен
             if manikin_days > 0:
@@ -298,7 +313,6 @@ class EducationCalculator:
         margin_rub = cost_price * 0.1
         recommended_price = cost_price + margin_rub
 
-        # Минимум
         min_key = "distance" if is_distance else "full_time"
         minimum = self.costs["minimum_price"].get(min_key, 10000)
         if recommended_price < minimum:
@@ -346,6 +360,8 @@ class EducationCalculator:
                 "overhead_cost": overhead_cost,
                 "labor_cost": labor_cost,
                 "full_time_cost": full_time_cost,
+                "venue_cost": venue_cost,
+                "is_office_city": is_office_city if not is_distance else None,
                 "auto_detected": auto,
             },
         )

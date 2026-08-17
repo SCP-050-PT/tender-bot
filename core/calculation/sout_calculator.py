@@ -41,20 +41,29 @@ class SoutCalculator:
         """
         Расчёт цены для клиента на СОУТ.
         v6.4.2: trips = regions_count, унифицированные командировочные.
+        v6.9.1: Годовые тендеры — основной расчёт, материалы, доставка ×12
         """
+        # v6.9.1: Годовой множитель
+        annual_mult = 12 if is_annual else 1
+
         # === Субподряд ИИИ ===
         subcontractor_cost, needs_manual_review_iii = self._calc_subcontractor(
             rm_with_iii, needs_subcontractor
         )
 
         # === Основной расчёт по варианту ===
-        price = self._calc_main_price(rm_total, rm_category_1, rm_category_2, variant)
+        price = (
+            self._calc_main_price(rm_total, rm_category_1, rm_category_2, variant)
+            * annual_mult
+        )
 
         # === Материалы и доставка ===
-        materials_cost = self._calc_materials()
-        delivery_cost = self._calc_delivery(delivery_count, is_annual)
+        materials_cost = self._calc_materials() * annual_mult
+        delivery_cost = self._calc_delivery(
+            delivery_count, is_annual
+        )  # уже учитывает is_annual
 
-        # === Командировочные ===
+        # === Командировочные (годовые — те же, не ×12) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
             self._calc_travel(
                 trip_days, regions_count, transport_cost, is_seasonal, cities_count

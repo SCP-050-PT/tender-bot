@@ -1,14 +1,18 @@
 """
 core/analysis/__init__.py
-Пакет анализа тендеров.
+Пакет анализа тендеров v6.8.6-r3.
 """
 
 from core.analysis.analyzer import TenderAnalyzer
-from core.analysis.llm_wrapper import LlmWrapper
-from core.analysis.result_formatter import TenderAnalysis
+from core.analysis.result import AnalysisResult
+from core.analysis.type_resolver import TypeResolver
+from core.analysis.guard_engine import GuardEngine
+from core.analysis.calculator_router import CalculatorRouter
 
 __all__ = [
     "TenderAnalyzer",
-    "LlmWrapper",
-    "TenderAnalysis",
+    "AnalysisResult",
+    "TypeResolver",
+    "GuardEngine",
+    "CalculatorRouter",
 ]

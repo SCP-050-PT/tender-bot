@@ -241,13 +241,17 @@ class TenderParamExtractor:
         return params
 
     def _extract_trip_days(self, text_lower: str) -> Optional[int]:
+        """Извлекает количество дней выезда."""
         match = re.search(
             r"(?:срок|длительность)[\s]*(?:выезда|командировки)[\s]*[\-—]?[\s]*(\d+)[\s]*дн",
             text_lower,
         )
         if match:
             return int(match.group(1))
-        return 3  # дефолт
+
+        # FIX v6.8.6-r3-p3: Возвращаем None вместо жёсткого дефолта 3
+        # Дефолт 3 дня ставит CalculatorRouter или Calculator
+        return None
 
     def _extract_deadline_date(self, text: str) -> Optional[str]:
         text_lower = text.lower()
@@ -466,66 +470,61 @@ class TenderParamExtractor:
         if not llm_result or not isinstance(llm_result, dict):
             return extracted
 
-        # Конвертируем ExtractedParams -> MergedParams
-        merged = MergedParams(
-            rm_total=extracted.rm_total,
-            rm_category_1=extracted.rm_category_1,
-            rm_category_2=extracted.rm_category_2,
-            rm_with_iii=extracted.rm_with_iii,
-            points_count=extracted.points_count,
-            students_count=extracted.students_count,
-            factors_count=extracted.factors_count,
-            addresses_count=extracted.addresses_count,
-            cities_count=extracted.cities_count,
-            regions_count=extracted.regions_count,
-            trips=extracted.trips,
-            trip_days=extracted.trip_days,
-            deadline_days=extracted.deadline_days,
-            deadline_text=extracted.deadline_text,
-            application_guarantee=extracted.application_guarantee,
-            contract_guarantee=extracted.contract_guarantee,
-            guarantee_method=extracted.guarantee_method,
-            has_full_time=extracted.has_full_time,
-            teacher_days=extracted.teacher_days,
-            accommodation_nights=extracted.accommodation_nights,
-            transport_km=extracted.transport_km,
-            venue_rent_days=extracted.venue_rent_days,
-            manikin_days=extracted.manikin_days,
-            has_polygon=extracted.has_polygon,
-            is_urgent=extracted.is_urgent,
-            urgency_days=extracted.urgency_days,
-            is_seasonal=extracted.is_seasonal,
-            needs_siz_norms=extracted.needs_siz_norms,
-            needs_dsiz_norms=extracted.needs_dsiz_norms,
-            needs_iot_norms=extracted.needs_iot_norms,
-            opr_positions=extracted.opr_positions,
-            opr_persons=extracted.opr_persons,
-            region_hint=extracted.region_hint,
-            confidence=extracted.confidence,
-            needs_manual_review=extracted.needs_manual_review,
-            review_reason=extracted.review_reason,
-            sources=dict(extracted.sources),
-        )
+        # FIX v6.8.6-r3-p1: Передаём extracted данные как regex_params,
+        # чтобы ParamMerger мог сравнить и выбрать лучшее
+        regex_params = {
+            "rm_total": extracted.rm_total,
+            "rm_category_1": extracted.rm_category_1,
+            "rm_category_2": extracted.rm_category_2,
+            "rm_with_iii": extracted.rm_with_iii,
+            "points_count": extracted.points_count,
+            "students_count": extracted.students_count,
+            "factors_count": extracted.factors_count,
+            "addresses_count": extracted.addresses_count,
+            "cities_count": extracted.cities_count,
+            "regions_count": extracted.regions_count,
+            "trips": extracted.trips,
+            "trip_days": extracted.trip_days,
+            "deadline_days": extracted.deadline_days,
+            "deadline_text": extracted.deadline_text,
+            "application_guarantee": extracted.application_guarantee,
+            "contract_guarantee": extracted.contract_guarantee,
+            "guarantee_method": extracted.guarantee_method,
+            "has_full_time": extracted.has_full_time,
+            "teacher_days": extracted.teacher_days,
+            "accommodation_nights": extracted.accommodation_nights,
+            "transport_km": extracted.transport_km,
+            "venue_rent_days": extracted.venue_rent_days,
+            "manikin_days": extracted.manikin_days,
+            "has_polygon": extracted.has_polygon,
+            "is_urgent": extracted.is_urgent,
+            "urgency_days": extracted.urgency_days,
+            "is_seasonal": extracted.is_seasonal,
+            "needs_siz_norms": extracted.needs_siz_norms,
+            "needs_dsiz_norms": extracted.needs_dsiz_norms,
+            "needs_iot_norms": extracted.needs_iot_norms,
+            "opr_positions": extracted.opr_positions,
+            "opr_persons": extracted.opr_persons,
+            "region_hint": extracted.region_hint,
+            "confidence": extracted.confidence,
+            "needs_manual_review": extracted.needs_manual_review,
+            "review_reason": extracted.review_reason,
+        }
 
-        # Merge с LLM
+        # Добавляем источники
+        for field, source in extracted.sources.items():
+            regex_params[f"{field}_source"] = source
+
         merged = self.param_merger.merge(
             ktru_params=None,
             table_params=None,
-            regex_params=None,
+            regex_params=regex_params,
             llm_params=llm_result,
             llm_confidence=llm_confidence,
             nmck=nmck,
         )
 
-        # НОВОЕ (всегда сохранять КТРУ, если LLM не дал лучше):
-        for field in ["rm_total", "students_count", "points_count"]:
-            extracted_val = getattr(extracted, field)
-            if extracted_val is not None and extracted_val > 0:
-                llm_val = getattr(merged, field)
-                if llm_val is None or llm_val == 0:
-                    setattr(merged, field, extracted_val)
-                    merged.sources[field] = extracted.sources.get(field, "ktru")
-
+        # Убран ручной fallback — теперь ParamMerger делает всё корректно
         return self._merged_to_extracted(merged)
 
     def build_enriched_prompt(

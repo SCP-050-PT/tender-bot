@@ -542,15 +542,72 @@ class Html223Parser(BaseHtmlParser):
                 result["contract_guarantee"] = "Не требуется"
 
     def parse_documents(self, soup: BeautifulSoup) -> List[Any]:
-        """Парсит документы для 223-ФЗ."""
+        """Парсит документы для 223-ФЗ.
+        
+        v6.8.6-r3-p4: Исправлен парсинг — теперь находит ВСЕ файлы
+        в блоке "Прикрепленные файлы".
+        """
         from core.parsers.detailed_parser import TenderDocument
 
         documents = []
-        for block in soup.find_all("div", class_="card-attachments-container"):
-            for attachment in block.find_all("div", class_="attachment"):
-                doc = self._parse_attachment_223(attachment)
-                if doc:
-                    documents.append(doc)
+        
+        # Ищем все блоки с прикреплёнными файлами
+        for attachment_value in soup.find_all("div", class_="attachment__value"):
+            # Проверяем, что это блок с файлами (а не с датой/статусом)
+            file_divs = attachment_value.find_all("div")
+            for file_div in file_divs:
+                # Ищем ссылку на файл
+                file_link = file_div.find("a", href=re.compile(r"filestore|download"))
+                if not file_link:
+                    continue
+                
+                href = file_link.get("href", "")
+                if not href:
+                    continue
+                
+                file_url = urljoin(self.BASE_URL, href)
+                
+                # Имя файла
+                file_name = file_link.get_text(strip=True)
+                if not file_name:
+                    file_name = file_link.get("title", "")
+                
+                # Тип файла по иконке
+                file_type = ""
+                img = file_link.find_previous("img", src=re.compile(r"/type/"))
+                if not img:
+                    img = file_div.find("img", src=re.compile(r"/type/"))
+                if img:
+                    src = img.get("src", "")
+                    file_type = self._detect_file_type(src)
+                
+                # Дата из родительского attachment
+                date = ""
+                is_active = True
+                attachment_block = attachment_value.find_parent("div", class_="attachment")
+                if attachment_block:
+                    date_text = attachment_block.find("div", class_="attachment__text", string=re.compile(r"Размещено"))
+                    if date_text:
+                        date_val = date_text.find_next("div", class_="attachment__value")
+                        if date_val and date_val != attachment_value:
+                            date = date_val.get_text(strip=True)
+                    
+                    status_elem = attachment_block.find("div", class_="attachment__value", string=re.compile(r"Действующая|Недействующая"))
+                    if status_elem:
+                        is_active = "Действующая" in status_elem.get_text(strip=True)
+                
+                doc = TenderDocument(
+                    name=file_name,
+                    url=file_url,
+                    file_type=file_type,
+                    date=date,
+                    is_active=is_active,
+                    file_url=file_url,
+                )
+                documents.append(doc)
+                logger.debug(f"[223-DOC] Найден файл: {file_name} ({file_type})")
+        
+        logger.info(f"[223-DOC] Всего найдено файлов: {len(documents)}")
         return documents
 
     def _parse_attachment_223(self, attachment) -> Optional[Any]:

@@ -9,8 +9,9 @@ utils/url_builder.py
   - Авто-определение типа закупки 44-ФЗ по ID (эвристика)
 """
 
-from typing import Optional
+from typing import Optional, List
 from urllib.parse import urljoin
+from datetime import datetime, date, timedelta
 from loguru import logger
 
 BASE_URL = "https://zakupki.gov.ru"
@@ -91,9 +92,60 @@ class TenderURLBuilder:
         else:
             return self._build_44_documents(reg_number, purchase_type_44)
 
-    def build_search_url(self, reg_number: str) -> str:
-        """Строит URL поиска по ID (fallback)."""
-        return f"{BASE_URL}/epz/order/extendedsearch/results.html?searchString={reg_number}"
+    def build_search_url(
+        self,
+        page: int = 1,
+        date_from: Optional[datetime.date] = None,
+        date_to: Optional[datetime.date] = None,
+        okpd2_ids: Optional[List[str]] = None,
+        min_nmck: Optional[int] = None,
+        publish_date_days: int = 3,
+    ) -> str:
+        """
+        Строит URL поиска тендеров на ЕИС.
+
+        Args:
+            page: Номер страницы
+            date_from: Дата публикации от
+            date_to: Дата публикации до
+            okpd2_ids: Список ID ОКПД2
+            min_nmck: Минимальная НМЦК
+            publish_date_days: Дней назад для публикации
+        """
+        from datetime import datetime, timedelta
+        from urllib.parse import urlencode
+
+        today = datetime.now().date()
+        if date_from is None:
+            date_from = today - timedelta(days=publish_date_days)
+        if date_to is None:
+            date_to = today
+
+        params = {
+            "morphology": "on",
+            "search-filter": "Дате+размещения",
+            "sortBy": "DEADLINE",
+            "sortDirection": "false",
+            "publishDateFrom": date_from.strftime("%d.%m.%Y"),
+            "currencyIdGeneral": "-1",
+            "showLotsInfoHidden": "false",
+            "pageNumber": str(page),
+            "recordsPerPage": "_50",
+            "fz44": "on",
+            "fz223": "on",
+            "af": "on",
+            "priceFromGeneral": str(min_nmck or 100000),
+        }
+
+        if okpd2_ids:
+            params["okpd2Ids"] = ",".join(okpd2_ids)
+            params["okpd2IdsWithNested"] = "on"
+
+        url = f"{BASE_URL}/epz/order/extendedsearch/results.html?{urlencode(params, safe='{}')}"
+        logger.info(
+            f"[SearchUrlBuilder] URL (стр. {page}, {date_from}–{date_to}): {url}"
+        )
+        return url
 
     def _build_44_common_info(
         self, reg_number: str, purchase_type: str = "ea20"
@@ -120,21 +172,31 @@ class TenderURLBuilder:
 
     def _build_223_common_info(self, reg_number: str, notice_guid: str = "") -> str:
         """URL common-info для 223-ФЗ."""
+        # v6.8.6-r3: Исправлен путь 223-ФЗ (notice223 вместо ea223/view)
         if notice_guid:
             return (
                 f"{BASE_URL}/epz/order/notice/notice223/common-info.html"
                 f"?noticeGuid={notice_guid}&regNumber={reg_number}"
             )
+        # Без noticeGuid — zakupki.gov.ru сам редиректит и добавит noticeGuid
         return (
-            f"{BASE_URL}/223/purchase/public/purchase/info/common-info.html"
+            f"{BASE_URL}/epz/order/notice/notice223/common-info.html"
             f"?regNumber={reg_number}"
         )
 
     def _build_223_documents(self, reg_number: str, notice_guid: str = "") -> str:
+        """URL документов для 223-ФЗ."""
+        # v6.8.6-r3: Исправлен путь 223-ФЗ
         if notice_guid:
-            return f"{BASE_URL}/epz/order/notice/notice223/documents.html?purchaseNoticeNumber={reg_number}&noticeGuid={notice_guid}"
-        # ← v6.4.2: fallback на рабочий URL без noticeGuid
-        return f"{BASE_URL}/epz/order/notice/notice223/documents.html?purchaseNoticeNumber={reg_number}"
+            return (
+                f"{BASE_URL}/epz/order/notice/notice223/documents.html"
+                f"?purchaseNoticeNumber={reg_number}&noticeGuid={notice_guid}"
+            )
+        # Fallback без noticeGuid (редиректит)
+        return (
+            f"{BASE_URL}/epz/order/notice/notice223/documents.html"
+            f"?purchaseNoticeNumber={reg_number}"
+        )
 
     def detect_44_purchase_type(self, title: str = "", method: str = "") -> str:
         """

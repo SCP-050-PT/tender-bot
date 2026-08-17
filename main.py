@@ -2,13 +2,21 @@
 """
 main.py
 Интеграционный скрипт TENDER-BOT v2.
-Пайплайн: Поиск → Детальный парсинг → LLM-анализ → Расчёт → Риски → Google Sheets
+Пайплайн: Поиск -> Детальный парсинг -> LLM-анализ -> Расчёт -> Риски -> Google Sheets
 
-ИСПРАВЛЕНО (v6.8.5):
+ИСПРАВЛЕНО (v6.8.6-r4):
   - DetailedParser инициализируется с session_manager из searcher
   - Используется fetch_and_parse() вместо parse() с неправильной сигнатурой
   - Fallback на поисковые данные (title, region, customer) при блокировке common-info
   - Добавлен _detect_type_from_title() для fallback-типа
+  - Исправлен интерактивный режим (передача tender_info вместо tender_text)
+  - Исправлено условие llm_confidence (0.0 -> проверка is not None)
+  - Убрано ненужное hasattr для _format_comment
+
+ИСПРАВЛЕНО (v6.9.1):
+  - Исправлен SyntaxError на строке 558 (application_guarantee)
+  - Добавлен is_annual для годовых тендеров
+  - Region гарантированно прокидывается в EducationCalculator
 """
 
 import sys
@@ -59,76 +67,125 @@ from core.parsers import DetailedParser
 from core.analysis import TenderAnalyzer
 
 
+def _parse_deadline_to_days(deadline_date_str: str) -> int:
+    """Парсит строку даты дедлайна в количество дней до него."""
+    if not deadline_date_str:
+        return 30
+
+    from datetime import datetime
+    import re
+
+    # Пробуем разные форматы
+    formats = [
+        "%d.%m.%Y",
+        "%d.%m.%Y %H:%M",
+        "%Y-%m-%d",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+
+    deadline_date_str = deadline_date_str.strip()
+
+    for fmt in formats:
+        try:
+            deadline = datetime.strptime(deadline_date_str, fmt)
+            delta = deadline - datetime.now()
+            return max(0, delta.days)
+        except ValueError:
+            continue
+
+    # Fallback: ищем дату в тексте
+    match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", deadline_date_str)
+    if match:
+        try:
+            deadline = datetime.strptime(match.group(0), "%d.%m.%Y")
+            delta = deadline - datetime.now()
+            return max(0, delta.days)
+        except ValueError:
+            pass
+
+    return 30
+
+
 def _detect_type_from_title(title: str) -> str:
     """Определяет тип тендера по названию из поисковой выдачи (fallback)."""
     if not title:
         return ""
     title_lower = title.lower()
-    if any(
-        kw in title_lower
-        for kw in [
-            "соут",
-            "специальная оценка условий труда",
-            "оценка условий труда",
-            "оценка рабочих мест",
-            "специальная оценка",
-            "вредные производственные факторы",
-            "класс условий труда",
-            "карта соут",
-            "протоколы измерений",
-        ]
-    ):
-        return "sout"
-    if any(
-        kw in title_lower
-        for kw in [
-            "обучение охране труда",
-            "обучение по охране труда",
-            "программа обучения",
-            "программа повышения квалификации",
-            "переподготовка",
-            "повышение квалификации",
-            "профессиональное обучение",
-            "слушатели",
-            "протоколы обучения",
-            "удостоверение",
-            "инструктаж",
-            "стажировка",
-        ]
-    ):
-        return "education"
-    if any(
-        kw in title_lower
-        for kw in [
-            "опр",
-            "оценка профессиональных рисков",
-            "профессиональный риск",
-            "проф. риск",
-            "профриск",
-            "мероприятия по снижению рисков",
-            "идентификация опасностей",
-        ]
-    ):
-        return "opr"
-    if any(
-        kw in title_lower
-        for kw in [
-            "производственный контроль",
-            "плк",
-            "лабораторные исследования",
-            "лабораторный контроль",
-            "замеры шума",
-            "замеры вибрации",
-            "санитарно-гигиенические исследования",
-        ]
-    ):
-        return "plk"
+
+    # === FIX: Проверяем целые слова, не подстроки ===
+    import re
+
+    # SOUT
+    sout_patterns = [
+        r"\bсоут\b",
+        r"специальная оценка условий труда",
+        r"оценка условий труда",
+        r"оценка рабочих мест",
+        r"специальная оценка",
+        r"вредные производственные факторы",
+        r"класс условий труда",
+        r"карта соут",
+        r"протоколы измерений",
+    ]
+    for pattern in sout_patterns:
+        if re.search(pattern, title_lower):
+            return "sout"
+
+    # EDUCATION
+    education_patterns = [
+        r"обучение\s+охране\s+труда",
+        r"обучение\s+по\s+охране\s+труда",
+        r"обучение\s+работодателей.*охран[аеы]\s+труда",
+        r"обучение\s+работников.*охран[аеы]\s+труда",
+        r"программа\s+обучения",
+        r"программа\s+повышения\s+квалификации",
+        r"переподготовка",
+        r"повышение\s+квалификации",
+        r"профессиональное\s+обучение",
+        r"\bслушатели\b",
+        r"протоколы\s+обучения",
+        r"\bудостоверение\b",
+        r"\bинструктаж\b",
+        r"\bстажировка\b",
+    ]
+    for pattern in education_patterns:
+        if re.search(pattern, title_lower):
+            return "education"
+
+    # OPR — целое слово "опр" или фразы
+    opr_patterns = [
+        r"\bопр\b",
+        r"оценка\s+профессиональных\s+рисков",
+        r"профессиональный\s+риск",
+        r"проф\.\s*риск",
+        r"профриск",
+        r"мероприятия\s+по\s+снижению\s+рисков",
+        r"идентификация\s+опасностей",
+    ]
+    for pattern in opr_patterns:
+        if re.search(pattern, title_lower):
+            return "opr"
+
+    # PLK
+    plk_patterns = [
+        r"производственн[а-я]*\s+контроль",
+        r"\bплк\b",
+        r"лабораторные\s+исследования",
+        r"лабораторный\s+контроль",
+        r"замеры\s+шума",
+        r"замеры\s+вибрации",
+        r"санитарно-гигиенические\s+исследования",
+    ]
+    for pattern in plk_patterns:
+        if re.search(pattern, title_lower):
+            return "plk"
+
     return ""
 
 
 def _build_tender_text(detail, documents_text: str) -> str:
     parts = [
-        f"НАЗВАНИЕ ЗАКУПКИ: {detail.purchase_name or detail.reg_number}",
+        f"НАЗВАНИЕ ЗАКУПКИ: {detail.purchase_name or detail.tender_id}",
         f"ЗАКАЗЧИК: {detail.customer_name or 'не указан'}",
         f"РЕГИОН: {detail.customer_region or 'не указан'}",
         f"АДРЕС ЗАКАЗЧИКА: {detail.customer_address or 'не указан'}",
@@ -279,6 +336,11 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     needs_manual = getattr(analysis, "needs_manual_review", False)
     llm_conf = getattr(analysis, "llm_confidence", 0.0)
 
+    if hasattr(analysis, "_format_comment"):
+        comment_for_sheets = analysis._format_comment()
+    else:
+        comment_for_sheets = analysis.comment
+
     return {
         "ID тендера": tender.tender_id,
         "Наименование услуг": detail.purchase_name if detail else tender.title,
@@ -299,11 +361,7 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         "Результат": "",
         "Дата заключения контракта": "",
         "Дата выполнения работ": "",
-        "Комментарии руководителя отдела по участию": (
-            analysis._format_comment()
-            if hasattr(analysis, "_format_comment")
-            else analysis.comment
-        ),
+        "Комментарии руководителя отдела по участию": comment_for_sheets,
         "Ручная проверка": "ДА" if needs_manual else "НЕТ",
         "Уверенность ИИ": f"{llm_conf:.2f}" if llm_conf > 0 else "",
     }
@@ -368,7 +426,6 @@ def run_analyze(
     detailed = None
     if not skip_detail:
         try:
-            # ← v6.8.5: Передаём session_manager из searcher!
             detailed = DetailedParser(session_manager=searcher.session_manager)
             logger.info("📄 DetailedParser инициализирован с session_manager")
         except Exception as e:
@@ -432,7 +489,39 @@ def run_analyze(
                     logger.info(
                         f"   🔒 Обеспечение: {detail.application_guarantee or 'не указано'}"
                     )
-                    documents_text = detail.documents_text or ""
+
+                    # === Обработка документов через DocumentProcessor ===
+                    documents_text = ""
+                    if detail.documents:
+                        try:
+                            from core.document_processor import (
+                                DocumentProcessor,
+                                DocumentInfo,
+                            )
+
+                            doc_processor = DocumentProcessor(
+                                session=searcher.session_manager.get_primary_session()
+                            )
+                            docs = []
+                            for doc_dict in detail.documents:
+                                docs.append(
+                                    DocumentInfo(
+                                        name=doc_dict.get("name", ""),
+                                        url=doc_dict.get("link", ""),
+                                        file_url=doc_dict.get("link", ""),
+                                        file_type=doc_dict.get("file_type", ""),
+                                    )
+                                )
+                            documents_text = doc_processor.process_documents(docs)
+                            detail.documents_text = documents_text
+                            logger.info(
+                                f"   📄 Текст документов: {len(documents_text)} симв."
+                            )
+                        except Exception as e:
+                            logger.warning(f"   ⚠️ Ошибка обработки документов: {e}")
+
+                    if not documents_text:
+                        documents_text = detail.documents_text or ""
                     if documents_text and len(documents_text) > 1000:
                         tender_text = documents_text
                         logger.info(
@@ -448,8 +537,7 @@ def run_analyze(
 
         # === ШАГ 2: Fallback — упрощённый текст ===
         if not tender_text:
-            tender_text = f"""
-НАЗВАНИЕ ЗАКУПКИ:
+            tender_text = f"""НАЗВАНИЕ ЗАКУПКИ:
 {tender.title}
 
 ЗАКАЗЧИК:
@@ -474,8 +562,12 @@ def run_analyze(
                     "purchase_name": detail.purchase_name or tender.title,
                     "customer_name": detail.customer_name or tender.customer or "",
                     "customer_region": detail.customer_region or tender.region or "",
+                    "region": detail.customer_region or tender.region or "",
                     "nmck": detail.nmck or tender.nmck or 0,
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
+                    "deadline_days": _parse_deadline_to_days(
+                        detail.deadline_date or tender.deadline_date or ""
+                    ),
                     "platform_name": detail.platform_name or "",
                     "requirements": detail.requirements or "",
                     "application_guarantee": (
@@ -488,6 +580,15 @@ def run_analyze(
                 tender_info["cities_count"] = detail.cities_count or 1
                 tender_info["regions_count"] = detail.regions_count or 1
                 tender_info["addresses_count"] = detail.addresses_count or 1
+
+                # === v6.9.1: Годовой тендер ===
+                tender_info["is_annual"] = bool(getattr(detail, "is_annual", False))
+
+                # === v6.9.1: Region для EducationCalculator (аренда помещения) ===
+                if not tender_info.get("region"):
+                    tender_info["region"] = (
+                        tender_info.get("customer_region", "") or tender.region or ""
+                    )
 
                 tender_type_lower = (detail.tender_type_hint or "").lower()
                 is_sout = tender_type_lower in (
@@ -519,15 +620,14 @@ def run_analyze(
                 if detail.tender_type_hint == "education":
                     tender_info["addresses_count"] = 1
 
-                if detail.rm_total > 0:
+                if (detail.rm_total or 0) > 0:
                     tender_info["rm_total"] = detail.rm_total
                     tender_info["rm_total_source"] = "ktru"
-                if detail.students_count > 0:
+                if (detail.students_count or 0) > 0:
                     tender_info["students_count"] = detail.students_count
                     tender_info["students_count_source"] = "ktru"
-                if detail.points_count > 0:
+                if (detail.points_count or 0) > 0:
                     tender_info["points_count"] = detail.points_count
-
                 if detail.has_full_time:
                     tender_info["has_full_time"] = True
                     tender_info["is_distance"] = False
@@ -542,18 +642,19 @@ def run_analyze(
                     if val > 0:
                         tender_info[field] = val
 
-                if detail.trip_days > 0:
+                if (detail.trip_days or 0) > 0:
                     tender_info["trip_days"] = detail.trip_days
-                tender_info["is_seasonal"] = getattr(detail, "is_seasonal", False)
-                if detail.opr_positions > 0:
+                tender_info["is_seasonal"] = bool(getattr(detail, "is_seasonal", False))
+
+                if (detail.opr_positions or 0) > 0:
                     tender_info["opr_positions"] = detail.opr_positions
-                if detail.opr_persons > 0:
+                if (detail.opr_persons or 0) > 0:
                     tender_info["opr_persons"] = detail.opr_persons
                 tender_info["needs_subcontractor"] = getattr(
                     detail, "needs_subcontractor", False
                 )
 
-            # ← v6.8.5: Fallback тип из title, если detail не дал тип
+            # <- Fallback тип из title, если detail не дал тип
             type_hint = detail.tender_type_hint if detail else None
             if not type_hint and tender.title:
                 type_hint = _detect_type_from_title(tender.title)
@@ -575,7 +676,7 @@ def run_analyze(
 
             analysis = analyzer.analyze(
                 tender_info=tender_info,
-                documents_text=documents_text,
+                documents_text=documents_text or tender_text,
                 llm_classification=classification,
                 llm_confidence=confidence,
                 tender_type_hint=type_hint,
@@ -734,7 +835,11 @@ def run_interactive():
 
     print("\n🤖 Анализирую...")
     try:
-        result = analyzer.analyze(tender_text=tender_text)
+        tender_info = {"documents_text": tender_text}
+        result = analyzer.analyze(
+            tender_info=tender_info,
+            documents_text=tender_text,
+        )
         result_dict = result.to_dict()
 
         print("\n" + "=" * 60)
@@ -749,11 +854,11 @@ def run_interactive():
         print(f"Решение: {result_dict['decision']}")
         if result_dict.get("needs_manual_review"):
             print("⚠️ ТРЕБУЕТСЯ РУЧНАЯ ПРОВЕРКА")
-        if result_dict.get("llm_confidence"):
+        if result_dict.get("llm_confidence") is not None:
             print(f"Уверенность ИИ: {result_dict['llm_confidence']:.2f}")
         print("-" * 60)
         print("Риски:")
-        for flag in result_dict["red_flags"]:
+        for flag in result_dict.get("red_flags", []):
             print(f"  • {flag}")
         print("-" * 60)
         print("Комментарий:")
@@ -762,6 +867,9 @@ def run_interactive():
 
     except Exception as e:
         logger.error(f"❌ Ошибка: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
 
 
 def main():

@@ -7,6 +7,11 @@ core/risk_rules.py
 - Guard: цена > НМЦК -> HIGH риск
 - Guard: маржа > 200% -> HIGH (с исключением для ОПР)
 - Улучшенное логирование
+
+ИСПРАВЛЕНО (v6.9.2):
+- FIX: margin > 200% не срабатывает при limit_applied=True (цена поднята лимитом)
+- FIX: cost/НМЦК guard убран — теперь в apply_global_limits()
+- FIX: добавлен guard на base_cost_price=0 (не удалось рассчитать)
 """
 
 from typing import Dict, Any, Optional
@@ -28,7 +33,7 @@ class RiskResult:
 class RiskAnalyzer:
     """Анализатор рисков тендеров."""
 
-    VERSION = "v6.8"
+    VERSION = "v6.9.2"
 
     def __init__(self, config: Optional[Dict] = None):
         self.config = config or {}
@@ -50,11 +55,38 @@ class RiskAnalyzer:
         deadline_days: int = 30,
         region: str = "",
         needs_manual_review: bool = False,
+        limit_applied: bool = False,  # v6.9.2: цена поднята лимитом
+        cost_to_nmck_ratio: float = 0.0,  # v6.9.2: из apply_global_limits
     ) -> Dict[str, Any]:
         """Анализирует риски тендера."""
         flags = []
         risk_level = "low"
         decision = "рекомендуется"
+
+        # v6.9.2: Guard - base_cost_price = 0 (не удалось рассчитать)
+        if cost_price <= 0:
+            flags.append("Себестоимость = 0 — не удалось рассчитать стоимость")
+            risk_level = "high"
+            decision = "не рекомендуется"
+            logger.error(f"[{self.VERSION}] GUARD: cost_price = 0")
+            return {
+                "risk_level": risk_level,
+                "decision": decision,
+                "flags": flags,
+                "needs_manual_review": True,
+            }
+
+        # v6.9.2: Guard - cost/НМЦК превышен (перенесено из risk_rules в global_limits)
+        # Но если global_limits не сработал, ловим здесь
+        if cost_to_nmck_ratio > 0.90:
+            flags.append(
+                f"Себестоимость ({cost_price:,.0f}₽) составляет {cost_to_nmck_ratio*100:.0f}% от НМЦК ({nmck:,.0f}₽)"
+            )
+            risk_level = "high"
+            decision = "не рекомендуется"
+            logger.error(
+                f"[{self.VERSION}] GUARD: cost/НМЦК = {cost_to_nmck_ratio*100:.1f}%"
+            )
 
         # v6.8: Guard - цена не должна превышать НМЦК
         recommended_price = cost_price * (1 + margin_percent / 100)
@@ -66,10 +98,15 @@ class RiskAnalyzer:
             decision = "не рекомендуется"
             logger.error(f"[{self.VERSION}] GUARD: цена > НМЦК")
 
-        # v6.8: Guard - маржа > 200%
+        # v6.9.2 FIX: Guard - маржа > 200%, НО не срабатывает если limit_applied
+        # (т.к. цена была искусственно поднята min_contract_sum)
         if margin_percent > self.thresholds["max_margin_percent"]:
-            # v6.8: Исключение для ОПР с малой себестоимостью
-            if (
+            if limit_applied:
+                logger.info(
+                    f"[{self.VERSION}] Маржа {margin_percent:.1f}% высокая, "
+                    f"но цена поднята лимитом (limit_applied=True) — НЕ считаем аномалией"
+                )
+            elif (
                 tender_type == "opr"
                 and cost_price < self.thresholds["opr_cost_threshold"]
             ):

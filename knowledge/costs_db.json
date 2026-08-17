@@ -1,6 +1,6 @@
 {
-  "version": "1.6.0",
-  "updated": "2026-07-26",
+  "version": "1.6.1",
+  "updated": "2026-08-10",
   "currency": "RUB",
   "global_limits": {
     "min_contract_sum": 10000,
@@ -281,7 +281,6 @@
       "note": "Если факторы вне области аккредитации"
     },
     "travel": {
-      "transport_default": 40000,
       "accommodation_default": 4000,
       "daily_allowance": 4000
     },
@@ -362,7 +361,7 @@
         "unit": "отправка"
       }
     },
-    "margin_percent": 30
+    "margin_percent": 10
   },
   "guarantees": {
     "application": {
@@ -525,5 +524,15 @@
         "note": "Печатать отдельно, не сшивать"
       }
     ]
-  }
+  },
+  "notes": [
+    {
+      "version": "1.6.1",
+      "date": "2026-08-10",
+      "changes": [
+        "opr.margin_percent: 30 → 10 (соответствует бизнес-логике)",
+        "plk.travel.transport_default: удалено (теперь расчёт по километражу)"
+      ]
+    }
+  ]
 }

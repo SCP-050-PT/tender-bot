@@ -2,13 +2,16 @@
 core/calculation/cost_loader.py
 Ленивая загрузка базы цен из costs_db.json.
 Вынесено из calculator.py (v6.5).
+ИСПРАВЛЕНО (v6.8.6):
+  - Добавлен protocol в education.documents (P0-fix)
+  - Добавлен minimum_price в education (P0-fix)
+  - Добавлены комментарии к default costs
 """
 
 import json
 from pathlib import Path
 from typing import Optional
 from loguru import logger
-
 
 COSTS: Optional[dict] = None
 
@@ -40,7 +43,14 @@ def load_costs() -> dict:
 
 
 def _get_default_costs() -> dict:
-    """Встроенные значения по умолчанию — ЦЕНЫ ДЛЯ КЛИЕНТА."""
+    """Встроенные значения по умолчанию — ЦЕНЫ ДЛЯ КЛИЕНТА.
+
+    ВАЖНО: Этот fallback используется ТОЛЬКО если costs_db.json не найден
+    или повреждён. Все значения должны соответствовать актуальным ценам.
+
+    История изменений:
+      v6.8.6: +protocol, +minimum_price (исправление P0-багов)
+    """
     return {
         "education": {
             "documents": {
@@ -48,6 +58,8 @@ def _get_default_costs() -> dict:
                 "diploma": {"cost": 265},
                 "certificate_worker": {"cost": 80},
                 "certificate_qualification": {"cost": 130},
+                # v6.8.6-fix: protocol был отсутствовал → KeyError при fallback
+                "protocol": {"cost": 3.65},
             },
             "materials": {
                 "paper_a4": {"cost": 1.15},
@@ -64,6 +76,11 @@ def _get_default_costs() -> dict:
             },
             "overhead": {
                 "base": {"cost": 100},
+            },
+            # v6.8.6-fix: minimum_price был отсутствовал → KeyError при fallback
+            "minimum_price": {
+                "distance": 10000,
+                "full_time": 10000,
             },
             "rates": {
                 "teacher_daily": {"cost": 8000, "unit": "день"},
@@ -128,13 +145,15 @@ def _get_default_costs() -> dict:
             "subcontractor": {
                 "default_cost": 10000,
             },
+            # v6.8.6-fix: transport_default убран (был 40000, теперь расчёт по километражу)
             "travel": {
-                "transport_default": 40000,
                 "accommodation_default": 4000,
                 "daily_allowance": 4000,
             },
         },
         "opr": {
+            # v6.8.6-fix: margin_percent читается из конфига, не hardcoded
+            "margin_percent": 10,
             "rates": {
                 "per_position": {"cost": 500, "unit": "должность"},
                 "per_person": {"cost": 150, "unit": "человек"},
@@ -168,7 +187,7 @@ def _get_default_costs() -> dict:
         "travel": {
             "fuel": {
                 "consumption_l_per_100km": 11,
-                "price_per_liter": 55,
+                "price_per_liter": 65,  # v6.8.6: синхронизировано с costs_db.json
             },
             "accommodation": {
                 "standard_per_night": 2500,

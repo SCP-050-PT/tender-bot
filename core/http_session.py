@@ -1,12 +1,9 @@
 """
 core/http_session.py
 Единая HTTP-сессия на базе curl_cffi.
-ИСПРАВЛЕНО (27.07.2026 v6.3):
-  - Консолидирована логика из searcher.py, detailed_parser.py
-  - Устранено дублирование создания сессии в detailed_parser.py
-  - Пул сессий для многопоточности
-  - Авто-ротация User-Agent
-  - Graceful fallback на requests
+ИСПРАВЛЕНО (v6.8.6):
+  - _update_headers → update_session_headers (публичный)
+  - _update_session_headers → псевдоним для обратной совместимости
 """
 
 import random
@@ -98,12 +95,13 @@ class HTTPSessionManager:
             logger.error(f"Ошибка создания сессии: {e}")
             session = curl_requests.Session()
 
-        self._update_headers(session, user_agent, platform)
+        self.update_session_headers(session, user_agent, platform)
         session.verify = False
         return session
 
-    def _update_headers(self, session, user_agent: str, platform: str):
-        """Обновляет заголовки сессии."""
+    # ========== v6.8.6: ПУБЛИЧНЫЙ МЕТОД ==========
+    def update_session_headers(self, session, user_agent: str, platform: str):
+        """Обновляет заголовки сессии (публичный метод)."""
         sec_ch_ua = '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
 
         session.headers.update(
@@ -124,6 +122,10 @@ class HTTPSessionManager:
             }
         )
 
+    # Обратная совместимость (deprecated, будет удалено в v7.0)
+    _update_headers = update_session_headers
+    _update_session_headers = update_session_headers
+
     def get_session(self, index: int = 0) -> Any:
         """Получает сессию из пула."""
         if not self._sessions:
@@ -139,7 +141,7 @@ class HTTPSessionManager:
         session = self.get_session(session_index)
         user_agent = get_random_user_agent()
         platform = get_platform_from_ua(user_agent)
-        self._update_headers(session, user_agent, platform)
+        self.update_session_headers(session, user_agent, platform)
         logger.debug(f"🎭 User-Agent изменён для сессии {session_index}")
 
     def calculate_delay(self) -> float:
@@ -166,23 +168,25 @@ class HTTPSessionManager:
             self._consecutive_429 = 0
 
     def make_request(
-        self, url: str, session_index: int = 0, timeout: int = 30, max_retries: int = 3
+        self,
+        url: str,
+        session_index: int = 0,
+        timeout: int = 30,
+        max_retries: int = 3,
+        headers: dict = None,
+        allow_redirects: bool = True,
     ) -> Optional[Any]:
-        """
-        Выполняет запрос с retry-логикой.
-
-        Returns: response object или None
-        """
         session = self.get_session(session_index)
-
         for attempt in range(max_retries):
+
             delay = self.calculate_delay()
             if attempt > 0:
                 logger.info(f"  ⏳ Попытка {attempt + 1}, задержка {delay:.1f}с...")
             time.sleep(delay)
 
             try:
-                response = session.get(url, timeout=timeout)
+                request_headers = headers or {}
+                response = session.get(url, timeout=timeout, headers=request_headers)
 
                 if response.status_code == 429:
                     self.handle_429()
@@ -229,8 +233,10 @@ def get_session(index: int = 0) -> Any:
     return get_session_manager().get_session(index)
 
 
-def make_request(url: str, timeout: int = 30, max_retries: int = 3) -> Optional[Any]:
+def make_request(
+    url: str, timeout: int = 30, max_retries: int = 3, headers: dict = None
+) -> Optional[Any]:
     """Удобная функция для выполнения запроса."""
     return get_session_manager().make_request(
-        url, timeout=timeout, max_retries=max_retries
+        url, timeout=timeout, max_retries=max_retries, headers=headers
     )

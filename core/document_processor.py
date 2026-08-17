@@ -1,12 +1,13 @@
 """
+core/document_processor.py
 Фасад для обработки документов тендера.
-Делегирует извлечение текста специализированным экстракторам.
 
-Багфиксы v6.6-r2:
-  - Корректное сохранение файлов с правильным расширением
-  - Fallback на zipfile при зависании python-docx
-  - Извлечение количества из «Обоснования НМЦК»
-  - Фильтрация фантомных чисел (телефоны, ИНН)
+РЕФАКТОРИНГ v6.8.6:
+  - Использует core.config.document_config (централизованный конфиг)
+  - Использует core.extractors (новые экстракторы)
+  - Уточнены CONTRACT_PATTERNS (не ловят ТЗ)
+  - Исправлена валидация файлов
+  - Корректное сохранение расширений
 """
 
 import os
@@ -22,6 +23,9 @@ from core.config.document_config import (
     FILE_PRIORITY,
     MAX_TEXT_LENGTH,
     MAX_CONTRACT_FILE_SIZE,
+    PDF_MAGIC,
+    ZIP_MAGIC,
+    OLE2_MAGIC,
 )
 from core.extractors import (
     DocxExtractor,
@@ -64,12 +68,12 @@ class DocumentProcessor:
 
     def __init__(self, download_dir: Optional[Path] = None, session=None):
         self.download_dir = (
-            download_dir or Path(__file__).resolve().parent.parent / "downloads"
+            download_dir or Path(__file__).resolve().parent / "downloads"
         )
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.session = session
 
-        # Инициализация экстракторов
+        # v6.8.6: Инициализация экстракторов
         self._extractors = {
             "docx": DocxExtractor(),
             "doc": DocxExtractor(),
@@ -142,6 +146,7 @@ class DocumentProcessor:
         return result
 
     def _is_contract_file(self, filename: str) -> bool:
+        """Проверяет, является ли файл контрактом/договором."""
         if not filename:
             return False
         name_lower = filename.lower()
@@ -151,6 +156,7 @@ class DocumentProcessor:
         return False
 
     def _get_file_priority(self, filename: str) -> int:
+        """Определяет приоритет файла по названию."""
         if not filename:
             return 0
         name_lower = filename.lower()
@@ -161,6 +167,7 @@ class DocumentProcessor:
         return max_priority
 
     def _process_single_document(self, doc: DocumentInfo) -> str:
+        """Обрабатывает один документ."""
         logger.info(f"[DocumentProcessor] Обработка: {doc.name} ({doc.file_type})")
 
         # Пропускаем большие контракты
@@ -184,7 +191,9 @@ class DocumentProcessor:
 
         # Обрезаем слишком длинный текст
         if len(text) > MAX_TEXT_LENGTH:
-            logger.info(f"[DocumentProcessor] Обрезано с {len(text)} до {MAX_TEXT_LENGTH}")
+            logger.info(
+                f"[DocumentProcessor] Обрезано с {len(text)} до {MAX_TEXT_LENGTH}"
+            )
             text = (
                 text[:MAX_TEXT_LENGTH]
                 + "\n[... текст обрезан — слишком длинный файл ...]"
@@ -202,10 +211,13 @@ class DocumentProcessor:
                 response = self.session.get(doc.file_url, timeout=30)
             else:
                 import requests
+
                 response = requests.get(doc.file_url, timeout=30, verify=False)
 
             if response.status_code != 200:
-                logger.warning(f"[DocumentProcessor] Статус {response.status_code}: {doc.file_url}")
+                logger.warning(
+                    f"[DocumentProcessor] Статус {response.status_code}: {doc.file_url}"
+                )
                 if response.status_code == 404:
                     logger.error(
                         f"[DocumentProcessor] 🔴 404 на файл: {doc.file_url}\n"
@@ -216,8 +228,8 @@ class DocumentProcessor:
             content_length = len(response.content)
             doc.file_size_bytes = content_length
 
-            # === БАГФИКС v6.6-r2: корректное расширение ===
-            safe_name = re.sub(r"[^\w\-_.]", "_", doc.name)[:100]
+            # === БАГФИКС v6.8.6: корректное расширение ===
+            safe_name = re.sub(r"[^\w\-_.]", "_", doc.name)[:80]
 
             # Пытаемся получить расширение из имени файла
             ext = Path(doc.name).suffix.lower()
@@ -237,12 +249,16 @@ class DocumentProcessor:
                 file_path = self.download_dir / f"{safe_name}_{int(time.time())}{ext}"
             else:
                 file_path = self.download_dir / f"{safe_name}_{int(time.time())}"
-                logger.warning(f"[DocumentProcessor] Не удалось определить расширение для {doc.name}")
+                logger.warning(
+                    f"[DocumentProcessor] Не удалось определить расширение для {doc.name}"
+                )
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
 
-            logger.info(f"[DocumentProcessor] Скачан: {file_path} ({content_length} байт)")
+            logger.info(
+                f"[DocumentProcessor] Скачан: {file_path} ({content_length} байт)"
+            )
             return file_path
 
         except Exception as e:
@@ -273,7 +289,6 @@ class DocumentProcessor:
 
     def _ext_from_magic(self, header: bytes) -> str:
         """Определяет расширение по магическим байтам."""
-        from core.config.document_config import PDF_MAGIC, ZIP_MAGIC, OLE2_MAGIC
         if header.startswith(PDF_MAGIC):
             return ".pdf"
         elif header.startswith(ZIP_MAGIC):
@@ -288,8 +303,9 @@ class DocumentProcessor:
             with open(file_path, "rb") as f:
                 header = f.read(8)
 
-            ext = (file_type.lower() if file_type else file_path.suffix.lower()).lstrip(".")
-            from core.config.document_config import PDF_MAGIC, ZIP_MAGIC
+            ext = (file_type.lower() if file_type else file_path.suffix.lower()).lstrip(
+                "."
+            )
 
             if ext in ["pdf"]:
                 if not header.startswith(PDF_MAGIC):
@@ -343,8 +359,7 @@ class DocumentProcessor:
         try:
             with open(file_path, "rb") as f:
                 header = f.read(8)
-            from core.config.document_config import PDF_MAGIC, ZIP_MAGIC, OLE2_MAGIC
-            if header.startswith(b"\x50\x4b\x03\x04"):
+            if header.startswith(ZIP_MAGIC):
                 return "zip"
             elif header.startswith(OLE2_MAGIC):
                 return "doc"

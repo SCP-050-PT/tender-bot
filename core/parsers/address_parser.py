@@ -13,8 +13,7 @@ import re
 from typing import Dict, Any, List, Set
 from loguru import logger
 
-from core.config.regions_config import RUSSIAN_REGIONS
-
+from knowledge.regions import RUSSIAN_REGIONS
 
 class AddressParser:
     """Извлекает города, регионы и количество выездов из адресной строки."""

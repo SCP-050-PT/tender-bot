@@ -1,7 +1,7 @@
 """
 core/analysis/llm_wrapper.py
 Обёртка для LLM-вызовов.
-v6.7.4: Исправлены баги с None, убрано сжатие.
+v6.8.6-r4: Исправлено: улучшен fallback парсинг + оценка РМ по НМЦК
 """
 
 import json
@@ -104,7 +104,8 @@ class LlmWrapper:
             parsed = self._parse_llm_response(result)
             if parsed is None:
                 logger.warning("[LLM] Пустой/невалидный ответ")
-                return None
+                # === НОВОЕ v6.8.6-r4: Fallback на оценку по НМЦК ===
+                return self._fallback_estimate(tender_info, classification)
 
             # Принудительно применяем classification если извлечение другое
             if classification:
@@ -114,14 +115,16 @@ class LlmWrapper:
                 extracted_type = (parsed.get("tender_type") or "").lower().strip()
 
                 if classified_type == "opr" and extracted_type in ("sout", "соут"):
-                    logger.warning(f"[v6.7.4] Исправление типа: {extracted_type} → opr")
+                    logger.warning(
+                        f"[v6.8.6-r4] Исправление типа: {extracted_type} → opr"
+                    )
                     parsed["tender_type"] = "opr"
                     parsed["notes"] = (
                         parsed.get("notes", "") + " [Тип скорректирован: ОПР]"
                     )
                 elif classified_type == "education" and extracted_type == "sout":
                     logger.warning(
-                        f"[v6.7.4] Исправление типа: {extracted_type} → education"
+                        f"[v6.8.6-r4] Исправление типа: {extracted_type} → education"
                     )
                     parsed["tender_type"] = "education"
                     parsed["notes"] = (
@@ -131,19 +134,71 @@ class LlmWrapper:
             return parsed
 
         except Exception as e:
-            # v6.7.4: Исправлен баг — parsed может быть не определена
             logger.error(f"Ошибка LLM-анализа: {e}")
-            if classification:
-                classified_type = classification.get("tender_type", "")
-                if classified_type:
-                    logger.warning(f"[v6.7.4] Fallback с типом {classified_type}")
-                    return {
-                        "tender_type": classified_type,
-                        "confidence": 0.0,
-                        "parse_error": True,
-                        "notes": "Ошибка анализа, тип из классификации",
-                    }
+            # === НОВОЕ v6.8.6-r4: Fallback на оценку по НМЦК ===
+            return self._fallback_estimate(tender_info, classification)
+
+    def _fallback_estimate(
+        self, tender_info: dict, classification: Optional[dict]
+    ) -> Optional[dict]:
+        """Fallback: оценка параметров по НМЦК и типу."""
+        if not classification:
             return None
+
+        classified_type = classification.get("tender_type", "")
+        nmck = tender_info.get("nmck", 0)
+
+        if classified_type == "sout" and nmck > 0:
+            estimated_rm = int(nmck / 1200)
+            logger.warning(
+                f"[LLM Fallback] Оценка РМ по НМЦК: "
+                f"{nmck} / 1200 ≈ {estimated_rm} РМ"
+            )
+            return {
+                "tender_type": "sout",
+                "rm_total": max(estimated_rm, 1),
+                "confidence": 0.1,
+                "notes": f"Оценка РМ по НМЦК: {nmck}/1200≈{estimated_rm}",
+                "parse_error": True,
+            }
+
+        if classified_type == "opr" and nmck > 0:
+            estimated_positions = int(nmck / 500)
+            logger.warning(
+                f"[LLM Fallback] Оценка позиций ОПР по НМЦК: "
+                f"{nmck} / 500 ≈ {estimated_positions}"
+            )
+            return {
+                "tender_type": "opr",
+                "opr_positions": max(estimated_positions, 1),
+                "confidence": 0.1,
+                "notes": f"Оценка позиций по НМЦК: {nmck}/500≈{estimated_positions}",
+                "parse_error": True,
+            }
+
+        if classified_type == "education" and nmck > 0:
+            estimated_students = int(nmck / 2500)
+            logger.warning(
+                f"[LLM Fallback] Оценка слушателей по НМЦК: "
+                f"{nmck} / 2500 ≈ {estimated_students}"
+            )
+            return {
+                "tender_type": "education",
+                "students_count": max(estimated_students, 1),
+                "confidence": 0.1,
+                "notes": f"Оценка слушателей по НМЦК: {nmck}/2500≈{estimated_students}",
+                "parse_error": True,
+            }
+
+        if classified_type:
+            logger.warning(f"[v6.8.6-r4] Fallback с типом {classified_type}")
+            return {
+                "tender_type": classified_type,
+                "confidence": 0.0,
+                "parse_error": True,
+                "notes": "Ошибка анализа, тип из классификации",
+            }
+        return None
 
     def _build_context(self, tender_info: dict, classification: Optional[dict]) -> str:
         """Строит контекст для промпта."""
@@ -177,7 +232,7 @@ class LlmWrapper:
         """Строит обогащённый промпт с найденными параметрами."""
         lines = ["=== НАЙДЕНО В ТЕКСТЕ (проверь и подтверди) ==="]
 
-        # v6.7.4: Безопасная проверка classification
+        # v6.8.6-r4: Безопасная проверка classification
         classified_type = ""
         if classification:
             classified_type = (classification.get("tender_type") or "").lower()
@@ -266,7 +321,7 @@ class LlmWrapper:
         text = result.strip()
         if not text:
             return None
-
+        logger.info(f"[LLM RAW RESPONSE] {repr(text[:2000])}")
         # Проверка на отказ
         refusal_patterns = [
             r"я\s+не\s+могу",
@@ -361,6 +416,81 @@ class LlmWrapper:
             "is_seasonal": False,
         }
 
+        # === НОВОЕ v6.8.6-r4: Извлечение чисел из текста по контексту ===
+        text_lower = text.lower()
+
+        # Извлечение количества РМ
+        rm_patterns = [
+            r"(\d+)\s*рабочих\s*мест",
+            r"(\d+)\s*рм\b",
+            r"количество\s*рабочих\s*мест[:\s]*(\d+)",
+            r"рабочие\s*места[:\s]*(\d+)",
+            r"оценить\s*(\d+)\s*рабочих",
+            r"в\s*количестве\s*(\d+)\s*единиц",
+            r"(\d+)\s*должност",
+            r"(\d+)\s*позиц",
+        ]
+        for pattern in rm_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result["rm_total"] = int(match.group(1))
+                logger.info(f"[LLM Fallback] Извлечено РМ: {result['rm_total']}")
+                break
+
+        # Извлечение количества слушателей
+        student_patterns = [
+            r"(\d+)\s*слушател",
+            r"(\d+)\s*человек",
+            r"обучить\s*(\d+)\s*сотрудник",
+            r"количество\s*слушателей[:\s]*(\d+)",
+            r"(\d+)\s*участник",
+        ]
+        for pattern in student_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result["students_count"] = int(match.group(1))
+                logger.info(
+                    f"[LLM Fallback] Извлечено слушателей: {result['students_count']}"
+                )
+                break
+
+        # Извлечение количества точек (ПЛК)
+        point_patterns = [
+            r"(\d+)\s*точек",
+            r"(\d+)\s*точки",
+            r"(\d+)\s*замер",
+            r"количество\s*точек[:\s]*(\d+)",
+        ]
+        for pattern in point_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result["points_count"] = int(match.group(1))
+                logger.info(f"[LLM Fallback] Извлечено точек: {result['points_count']}")
+                break
+
+        # Извлечение типа тендера из текста
+        if any(
+            kw in text_lower
+            for kw in ["оценка профессиональных рисков", "опр", "проф. риск"]
+        ):
+            result["tender_type"] = "opr"
+        elif any(
+            kw in text_lower
+            for kw in [
+                "специальная оценка условий труда",
+                "соут",
+                "оценка условий труда",
+            ]
+        ):
+            result["tender_type"] = "sout"
+        elif any(kw in text_lower for kw in ["обучение", "курсы", "программа"]):
+            result["tender_type"] = "education"
+        elif any(
+            kw in text_lower
+            for kw in ["лабораторный контроль", "плк", "лабораторные исследования"]
+        ):
+            result["tender_type"] = "plk"
+
         num_patterns = [
             ("tender_type", r"tender_type\s*[:=]\s*([^,}\n]+)"),
             ("students_count", r"students_count\s*[:=]\s*(\d+)"),
@@ -401,7 +531,7 @@ class LlmWrapper:
             if match:
                 val = match.group(1).strip().lower()
                 if key == "tender_type":
-                    result[key] = val.strip("\"'")
+                    result[key] = val.strip("\"''")
                 else:
                     try:
                         result[key] = int(float(val))

@@ -1,6 +1,15 @@
 """
-Экстрактор текста из ZIP-архивов.
-Распаковывает и рекурсивно обрабатывает вложенные файлы.
+core/extractors/zip_extractor.py
+Единый экстрактор текста из ZIP-архивов.
+
+ОБЪЕДИНЁН (v6.8.6-r1):
+  - База: core/extractors/ v6.6-r2 (ленивая инициализация, FILE_PRIORITY, CONTRACT_PATTERNS)
+  - Добавлено из core/documents/ v6.8.6:
+    * Декодирование cp1251 (3 кодировки: utf-8, cp866, cp1251)
+    * max_depth для рекурсии (в дополнение к max_files)
+  - Убрано:
+    * Заглушки lambda по умолчанию (используем конфиг)
+    * Хардкод приоритетов и паттернов контрактов
 """
 
 import re
@@ -16,14 +25,19 @@ from core.extractors.base_extractor import BaseExtractor
 
 
 class ZipExtractor(BaseExtractor):
-    """Извлекает текст из ZIP-архивов, обрабатывая вложенные файлы."""
+    """Единый экстрактор текста из ZIP-архивов."""
 
     SUPPORTED_EXTENSIONS = ["zip"]
 
-    def __init__(self, max_files: int = 3):
+    def __init__(self, max_files: int = 3, max_depth: int = 2):
+        """
+        Args:
+            max_files: максимальное количество файлов для обработки
+            max_depth: максимальная глубина вложенности ZIP (v6.8.6-r1)
+        """
         super().__init__()
         self.max_files = max_files
-        # Инициализируем суб-экстракторы для вложенных файлов
+        self.max_depth = max_depth  # v6.8.6-r1: из core/documents/
         self._sub_extractors = {}
 
     def _get_sub_extractor(self, ext: str):
@@ -31,21 +45,35 @@ class ZipExtractor(BaseExtractor):
         if ext not in self._sub_extractors:
             if ext in ["docx", "doc"]:
                 from core.extractors.docx_extractor import DocxExtractor
+
                 self._sub_extractors[ext] = DocxExtractor()
             elif ext == "pdf":
                 from core.extractors.pdf_extractor import PdfExtractor
+
                 self._sub_extractors[ext] = PdfExtractor()
             elif ext in ["xlsx", "xls"]:
                 from core.extractors.excel_extractor import ExcelExtractor
+
                 self._sub_extractors[ext] = ExcelExtractor()
             elif ext == "zip":
-                self._sub_extractors[ext] = ZipExtractor(max_files=self.max_files)
+                self._sub_extractors[ext] = ZipExtractor(
+                    max_files=self.max_files,
+                    max_depth=self.max_depth - 1,  # v6.8.6-r1: уменьшаем глубину
+                )
             elif ext in ["txt", "rtf"]:
                 from core.extractors.text_extractor import TextExtractor
+
                 self._sub_extractors[ext] = TextExtractor()
         return self._sub_extractors.get(ext)
 
     def extract(self, file_path: Path, doc_name: str = "") -> str:
+        """Распаковывает ZIP и извлекает текст из вложенных файлов."""
+        if self.max_depth <= 0:
+            logger.warning(
+                f"[ZipExtractor] Достигнут лимит глубины рекурсии: {doc_name}"
+            )
+            return ""
+
         temp_dir = Path(tempfile.mkdtemp(prefix="tender_zip_"))
         texts = []
 
@@ -81,7 +109,9 @@ class ZipExtractor(BaseExtractor):
         return [
             f
             for f in z.namelist()
-            if not f.startswith("__MACOSX/") and not f.startswith(".") and not f.endswith("/")
+            if not f.startswith("__MACOSX/")
+            and not f.startswith(".")
+            and not f.endswith("/")
         ]
 
     def _prioritize_files(self, files: List[str]) -> List[tuple]:
@@ -98,6 +128,7 @@ class ZipExtractor(BaseExtractor):
         return prioritized
 
     def _get_file_priority(self, filename: str) -> int:
+        """Определяет приоритет файла по имени."""
         if not filename:
             return 0
         name_lower = filename.lower()
@@ -108,6 +139,7 @@ class ZipExtractor(BaseExtractor):
         return max_priority
 
     def _is_contract_file(self, filename: str) -> bool:
+        """Проверяет, является ли файл контрактом/договором."""
         if not filename:
             return False
         name_lower = filename.lower()
@@ -120,14 +152,8 @@ class ZipExtractor(BaseExtractor):
         self, z: zipfile.ZipFile, fname: str, ext: str, temp_dir: Path
     ) -> str:
         """Извлекает один файл из ZIP и обрабатывает его."""
-        # Декодируем имя файла
-        try:
-            decoded_fname = fname.encode("cp437").decode("utf-8")
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            try:
-                decoded_fname = fname.encode("cp437").decode("cp866")
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                decoded_fname = fname
+        # v6.8.6-r1: Декодирование с 3 кодировками (добавлен cp1251)
+        decoded_fname = self._decode_filename(fname)
 
         safe_fname = re.sub(r"[^\w\-_.]", "_", decoded_fname)[:100]
         extracted_path = temp_dir / safe_fname
@@ -146,9 +172,21 @@ class ZipExtractor(BaseExtractor):
             logger.info(f"[ZipExtractor] {decoded_fname}: {len(text)} симв.")
             return text
         else:
-            # Пробуем определить по содержимому
             from core.extractors.text_extractor import TextExtractor
+
             return TextExtractor().extract(extracted_path, decoded_fname)
+
+    def _decode_filename(self, fname: str) -> str:
+        """Декодирует имя файла из ZIP.
+
+        v6.8.6-r1: Добавлен cp1251 (3 кодировки вместо 2).
+        """
+        for encoding in ["utf-8", "cp866", "cp1251"]:
+            try:
+                return fname.encode("cp437").decode(encoding)
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                continue
+        return fname
 
     def _detect_by_content(self, file_path: Path) -> str:
         """Определяет тип файла по магическим байтам."""
@@ -156,6 +194,7 @@ class ZipExtractor(BaseExtractor):
             with open(file_path, "rb") as f:
                 header = f.read(8)
             from core.config.document_config import PDF_MAGIC, ZIP_MAGIC, OLE2_MAGIC
+
             if header.startswith(PDF_MAGIC):
                 return "pdf"
             elif header.startswith(ZIP_MAGIC):

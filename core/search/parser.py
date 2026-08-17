@@ -1,6 +1,10 @@
 """
 Парсинг HTML-карточек тендеров с zakupki.gov.ru.
 Вынесено из searcher.py (v6.6-r2).
+
+РЕФАКТОРИНГ v6.8.6:
+  - Добавлено извлечение region из адреса заказчика
+  - Добавлен _extract_region_from_address()
 """
 
 import re
@@ -9,11 +13,12 @@ from dataclasses import dataclass, field
 from loguru import logger
 
 from bs4 import BeautifulSoup
-
+from knowledge.regions import RegionResolver
 
 @dataclass
 class TenderSearchResult:
     """Результат поиска тендера."""
+
     tender_id: str
     title: str
     url: str
@@ -132,7 +137,6 @@ class SearchResultParser:
             if self.price_parser:
                 nmck = self.price_parser.parse(price_text)
             else:
-                # Fallback: простой парсинг
                 nmck = self._parse_price_fallback(price_text)
 
         # Даты
@@ -161,12 +165,15 @@ class SearchResultParser:
                 if match:
                     notice_guid = match.group(1)
 
+        # ========== v6.8.6: ИЗВЛЕЧЕНИЕ РЕГИОНА ==========
+        region = self._extract_region(card, customer)
+
         return TenderSearchResult(
             tender_id=tender_id,
             title=title,
             url=purchase_url,
             nmck=nmck,
-            region=None,
+            region=region,
             publish_date=publish_date,
             deadline_date=deadline_date,
             etp="zakupki.gov.ru",
@@ -176,6 +183,24 @@ class SearchResultParser:
             status=status,
             notice_guid=notice_guid,
         )
+
+    def _extract_region(self, card: Any, customer: Optional[str]) -> Optional[str]:
+        """Извлекает регион из карточки тендера (поисковая выдача)."""
+        # Пробуем найти адрес заказчика в карточке
+        address = None
+        address_elems = card.find_all("div", class_="registry-entry__body-value")
+        for elem in address_elems:
+            text = elem.get_text(strip=True)
+            if any(
+                kw in text.lower()
+                for kw in ["обл.", "край", "респ.", "г.", "ул.", "проспект"]
+            ):
+                address = text
+                break
+
+        # Используем единый резолвер
+        text_to_search = address or customer or ""
+        return RegionResolver.resolve_from_search_text(text_to_search)
 
     def extract_total_count(self, html: str) -> int:
         """Извлекает общее количество результатов из HTML."""
