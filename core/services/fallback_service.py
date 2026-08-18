@@ -132,5 +132,17 @@ class FallbackService:
                     f"estimated_positions={estimated} "
                     f"(НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
-
+                
+        elif tender_type == "testing":
+            # Testing: используем коэффициент PLK как ближайший аналог
+            estimated_points = int(round(nmck / 170))
+            if estimated_points > 0:
+                tender_info["measurement_points"] = estimated_points
+                tender_info["measurement_points_source"] = "nmck_estimate_testing"
+                logger.info(
+                    f"[{FallbackService.VERSION}] FALLBACK testing: "
+                    f"estimated_points={estimated_points} (НМЦК {nmck:,.0f} / 170)"
+                )
         return tender_info
+
+        

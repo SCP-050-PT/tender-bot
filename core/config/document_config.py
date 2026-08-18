@@ -122,7 +122,6 @@ NMCK_FILE_KEYWORDS = [
     "расчет",
     "расчёт",
 ]
-
 # === КЛЮЧЕВЫЕ СЛОВА ДЛЯ КОЛОНОК ЦЕНЫ ЗА ЕДИНИЦУ (v7.1.0) ===
 UNIT_PRICE_COLUMN_KEYWORDS = [
     "начальная цена единицы",
@@ -137,7 +136,6 @@ UNIT_PRICE_COLUMN_KEYWORDS = [
     "цена единицы товара",
     "нач. цена ед.",
 ]
-
 # === ЛИМИТЫ ===
 MAX_DOCX_TIMEOUT = 30
 MAX_TEXT_LENGTH = 50000
