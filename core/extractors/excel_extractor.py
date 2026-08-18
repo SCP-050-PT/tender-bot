@@ -4,6 +4,8 @@
   - Корректное извлечение количества из «Обоснования НМЦК»
   - Поиск количества даже без колонки «услуга»
   - Фильтрация фантомных чисел (телефоны, адреса)
+
+v7.1.0: Извлечение цены за единицу из обоснований НМЦК (openpyxl + xlrd)
 """
 
 import re
@@ -15,17 +17,20 @@ from core.config.document_config import (
     QUANTITY_COLUMN_KEYWORDS,
     SERVICE_ROW_KEYWORDS,
     NMCK_FILE_KEYWORDS,
+    UNIT_PRICE_COLUMN_KEYWORDS,
 )
 from core.extractors.base_extractor import BaseExtractor
 
 try:
     import openpyxl
+
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
 
 try:
     import xlrd
+
     HAS_XLRD = True
 except ImportError:
     HAS_XLRD = False
@@ -82,18 +87,17 @@ class ExcelExtractor(BaseExtractor):
         try:
             wb = openpyxl.load_workbook(file_path, data_only=True)
             all_texts = []
-            extracted_quantities = []  # Найденные количества для приоритизации
+            extracted_quantities = []
 
             for sheet in wb.worksheets:
                 sheet_texts, quantities = self._process_sheet_openpyxl(sheet, doc_name)
                 all_texts.extend(sheet_texts)
                 extracted_quantities.extend(quantities)
 
-            # Добавляем найденные количества в начало
             if extracted_quantities:
                 prefix = "\n".join(
                     f"=== ИЗВЛЕЧЕНО ИЗ ТАБЛИЦЫ: Количество = {q} ==="
-                    for q in extracted_quantities[:5]  # max 5
+                    for q in extracted_quantities[:5]
                 )
                 all_texts.insert(0, prefix)
 
@@ -111,32 +115,34 @@ class ExcelExtractor(BaseExtractor):
     def _process_sheet_openpyxl(
         self, sheet, doc_name: str
     ) -> Tuple[List[str], List[int]]:
-        """Обрабатывает один лист XLSX. Возвращает (тексты, количества)."""
+        """Обрабатывает один лист XLSX. Возвращает (тексты, количества).
+        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК."""
         sheet_texts = []
         extracted_quantities = []
         headers = []
         quantity_col_idx = -1
         service_col_idx = -1
+        unit_price_col_idx = -1
         is_nmck_file = self._is_nmck_file(doc_name)
 
         for row_idx, row in enumerate(sheet.iter_rows()):
             row_values = [
-                str(cell.value) if cell.value is not None else ""
-                for cell in row
+                str(cell.value) if cell.value is not None else "" for cell in row
             ]
             row_text = [v for v in row_values if v.strip()]
 
             if not row_text:
                 continue
 
-            # Определяем заголовки (первая непустая строка)
-            if row_idx == 0 or (row_idx < 3 and not headers):
+            # Определяем заголовки (первые непустые строки)
+            if row_idx == 0 or (row_idx < 5 and not headers):
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
+                unit_price_col_idx = self._find_unit_price_column(headers)
                 logger.debug(
                     f"[ExcelExtractor] Заголовки: qty_col={quantity_col_idx}, "
-                    f"svc_col={service_col_idx}"
+                    f"svc_col={service_col_idx}, price_col={unit_price_col_idx}"
                 )
                 continue
 
@@ -151,6 +157,21 @@ class ExcelExtractor(BaseExtractor):
             )
             if qty is not None and qty not in extracted_quantities:
                 extracted_quantities.append(qty)
+
+            # v7.1.0: Извлекаем цену за единицу из обоснования НМЦК
+            if is_nmck_file and unit_price_col_idx >= 0:
+                price = self._extract_unit_price_from_row(
+                    row_values, unit_price_col_idx, service_col_idx
+                )
+                if price is not None:
+                    prefix_line = (
+                        f"=== ЦЕНА ЗА ЕДИНИЦУ ИЗ ОБОСНОВАНИЯ НМЦК: {price:.2f} ₽ ==="
+                    )
+                    if prefix_line not in sheet_texts:
+                        sheet_texts.insert(0, prefix_line)
+                        logger.info(
+                            f"[ExcelExtractor v7.1.0] Цена за ед. из НМЦК: {price:.2f} ₽"
+                        )
 
         if sheet_texts:
             sheet_texts.insert(0, f"=== ЛИСТ: {sheet.title} ===")
@@ -187,15 +208,15 @@ class ExcelExtractor(BaseExtractor):
             logger.error(f"[ExcelExtractor] Ошибка xlrd: {e}")
             return self._extract_fallback(file_path)
 
-    def _process_sheet_xlrd(
-        self, sheet, doc_name: str
-    ) -> Tuple[List[str], List[int]]:
-        """Обрабатывает один лист XLS."""
+    def _process_sheet_xlrd(self, sheet, doc_name: str) -> Tuple[List[str], List[int]]:
+        """Обрабатывает один лист XLS.
+        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК."""
         sheet_texts = []
         extracted_quantities = []
         headers = []
         quantity_col_idx = -1
         service_col_idx = -1
+        unit_price_col_idx = -1  # v7.1.0
         is_nmck_file = self._is_nmck_file(doc_name)
 
         for row_idx in range(sheet.nrows):
@@ -208,21 +229,44 @@ class ExcelExtractor(BaseExtractor):
             if not row_text:
                 continue
 
-            if row_idx == 0 or (row_idx < 3 and not headers):
+            # Определяем заголовки (первые непустые строки)
+            if row_idx == 0 or (row_idx < 5 and not headers):
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
+                unit_price_col_idx = self._find_unit_price_column(headers)  # v7.1.0
+                logger.debug(
+                    f"[ExcelExtractor] XLS заголовки: qty_col={quantity_col_idx}, "
+                    f"svc_col={service_col_idx}, price_col={unit_price_col_idx}"
+                )
                 continue
 
+            # Формируем строку с подписями заголовков
             enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
             if enriched_row:
                 sheet_texts.append(" | ".join(enriched_row))
 
+            # Ищем количество
             qty = self._extract_quantity_from_row(
                 row_values, headers, quantity_col_idx, service_col_idx, is_nmck_file
             )
             if qty is not None and qty not in extracted_quantities:
                 extracted_quantities.append(qty)
+
+            # v7.1.0: Извлекаем цену за единицу из обоснования НМЦК
+            if is_nmck_file and unit_price_col_idx >= 0:
+                price = self._extract_unit_price_from_row(
+                    row_values, unit_price_col_idx, service_col_idx
+                )
+                if price is not None:
+                    prefix_line = (
+                        f"=== ЦЕНА ЗА ЕДИНИЦУ ИЗ ОБОСНОВАНИЯ НМЦК: {price:.2f} ₽ ==="
+                    )
+                    if prefix_line not in sheet_texts:
+                        sheet_texts.insert(0, prefix_line)
+                        logger.info(
+                            f"[ExcelExtractor v7.1.0] XLS цена за ед. из НМЦК: {price:.2f} ₽"
+                        )
 
         if sheet_texts:
             sheet_texts.insert(0, f"=== ЛИСТ: {sheet.name} ===")
@@ -241,6 +285,14 @@ class ExcelExtractor(BaseExtractor):
         """Находит индекс колонки с наименованием услуги."""
         for idx, h in enumerate(headers):
             if any(kw in h for kw in ["наименование", "услуга", "работа", "предмет"]):
+                return idx
+        return -1
+
+    def _find_unit_price_column(self, headers: List[str]) -> int:
+        """Находит индекс колонки с ценой за единицу (v7.1.0)."""
+        for idx, h in enumerate(headers):
+            if any(kw in h for kw in UNIT_PRICE_COLUMN_KEYWORDS):
+                logger.info(f"[ExcelExtractor] Колонка цены за ед.: '{h}' (idx {idx})")
                 return idx
         return -1
 
@@ -312,18 +364,54 @@ class ExcelExtractor(BaseExtractor):
 
         # Для «Обоснования НМЦК» — не требуем колонку услуги
         if is_nmck_file:
-            logger.info(
-                f"[ExcelExtractor] Найдено qty={qty} (Обоснование НМЦК)"
-            )
+            logger.info(f"[ExcelExtractor] Найдено qty={qty} (Обоснование НМЦК)")
             return qty
 
         # Если нет колонки услуги и это не НМЦК — всё равно возвращаем
-        # (пусть analyzer решает, подходит ли)
         if service_col_idx < 0:
             logger.info(f"[ExcelExtractor] Найдено qty={qty} (без колонки услуги)")
             return qty
 
         return None
+
+    def _extract_unit_price_from_row(
+        self,
+        row_values: List[str],
+        unit_price_col_idx: int,
+        service_col_idx: int,
+    ) -> Optional[float]:
+        """Извлекает цену за единицу из строки обоснования НМЦК (v7.1.0)."""
+        if unit_price_col_idx < 0 or unit_price_col_idx >= len(row_values):
+            return None
+
+        price_cell = row_values[unit_price_col_idx]
+        if not price_cell or not price_cell.strip():
+            return None
+
+        price_str = str(price_cell).replace(" ", "").replace(",", ".")
+
+        # Убираем текст типа "руб." или "₽"
+        price_str = re.sub(r"[^\d.]", "", price_str)
+
+        if not price_str:
+            return None
+
+        try:
+            price = float(price_str)
+        except (ValueError, TypeError):
+            return None
+
+        # Sanity check: цена за единицу СОУТ/ПЛК/ОПР обычно 100-50000 ₽
+        if price <= 0 or price > 100000:
+            return None
+
+        # Проверяем, что строка содержит релевантную услугу
+        if service_col_idx >= 0 and service_col_idx < len(row_values):
+            service_str = str(row_values[service_col_idx]).lower()
+            if any(kw in service_str for kw in SERVICE_ROW_KEYWORDS):
+                return price
+
+        return price
 
     def _is_phantom_number(self, text: str) -> bool:
         """Проверяет, является ли строка фантомным числом (телефон, ИНН и т.д.)."""

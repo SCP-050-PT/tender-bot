@@ -1,22 +1,14 @@
 #!/usr/bin/env python3
 """
 main.py
-Интеграционный скрипт TENDER-BOT v2.
+Интеграционный скрипт TENDER-BOT v7.0.0.
 Пайплайн: Поиск -> Детальный парсинг -> LLM-анализ -> Расчёт -> Риски -> Google Sheets
 
-ИСПРАВЛЕНО (v6.8.6-r4):
-  - DetailedParser инициализируется с session_manager из searcher
-  - Используется fetch_and_parse() вместо parse() с неправильной сигнатурой
-  - Fallback на поисковые данные (title, region, customer) при блокировке common-info
-  - Добавлен _detect_type_from_title() для fallback-типа
-  - Исправлен интерактивный режим (передача tender_info вместо tender_text)
-  - Исправлено условие llm_confidence (0.0 -> проверка is not None)
-  - Убрано ненужное hasattr для _format_comment
-
-ИСПРАВЛЕНО (v6.9.1):
-  - Исправлен SyntaxError на строке 558 (application_guarantee)
-  - Добавлен is_annual для годовых тендеров
-  - Region гарантированно прокидывается в EducationCalculator
+v7.0.0: Рефакторинг
+  - Убран _detect_type_from_title() (дубль TypeService)
+  - Убрано дублирование логов
+  - type_hint определяется ТОЛЬКО через TypeService
+  - Исправлена передача documents_text в fallback
 """
 
 import sys
@@ -25,25 +17,27 @@ import json
 import csv
 from pathlib import Path
 from datetime import datetime
-from core.calculation.calculator import TenderCalculator
-from core.risk_rules import RiskAnalyzer
-from core.tender_type import get_type_detector
 
-# Настройка логирования
+# === ЛОГИРОВАНИЕ (ОДИН источник) ===
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 try:
     from loguru import logger
 
+    # Убираем дефолтный хендлер loguru чтобы не было дублей
     logger.remove()
+
+    # Файловый лог
     logger.add(
         LOG_DIR / "tender_bot.log",
         rotation="10 MB",
         retention="30 days",
-        level="INFO",
+        level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
     )
+
+    # Консольный лог (без дублей)
     logger.add(
         sys.stdout,
         level="INFO",
@@ -56,12 +50,15 @@ except ImportError:
     logger = logging.getLogger("tender_bot")
 
 
+# === ИМПОРТЫ ===
+from core.calculation.calculator import TenderCalculator
+from core.risk_rules import RiskAnalyzer
+from core.tender_type import get_type_detector
 from core.google_sheets import SHEET_COLUMNS
 from utils.price_parser import (
     format_for_sheets as _format_nmck,
     format_for_sheets as _format_price,
 )
-
 from core.search import create_searcher
 from core.parsers import DetailedParser
 from core.analysis import TenderAnalyzer
@@ -72,10 +69,8 @@ def _parse_deadline_to_days(deadline_date_str: str) -> int:
     if not deadline_date_str:
         return 30
 
-    from datetime import datetime
     import re
 
-    # Пробуем разные форматы
     formats = [
         "%d.%m.%Y",
         "%d.%m.%Y %H:%M",
@@ -93,7 +88,6 @@ def _parse_deadline_to_days(deadline_date_str: str) -> int:
         except ValueError:
             continue
 
-    # Fallback: ищем дату в тексте
     match = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", deadline_date_str)
     if match:
         try:
@@ -106,84 +100,8 @@ def _parse_deadline_to_days(deadline_date_str: str) -> int:
     return 30
 
 
-def _detect_type_from_title(title: str) -> str:
-    """Определяет тип тендера по названию из поисковой выдачи (fallback)."""
-    if not title:
-        return ""
-    title_lower = title.lower()
-
-    # === FIX: Проверяем целые слова, не подстроки ===
-    import re
-
-    # SOUT
-    sout_patterns = [
-        r"\bсоут\b",
-        r"специальная оценка условий труда",
-        r"оценка условий труда",
-        r"оценка рабочих мест",
-        r"специальная оценка",
-        r"вредные производственные факторы",
-        r"класс условий труда",
-        r"карта соут",
-        r"протоколы измерений",
-    ]
-    for pattern in sout_patterns:
-        if re.search(pattern, title_lower):
-            return "sout"
-
-    # EDUCATION
-    education_patterns = [
-        r"обучение\s+охране\s+труда",
-        r"обучение\s+по\s+охране\s+труда",
-        r"обучение\s+работодателей.*охран[аеы]\s+труда",
-        r"обучение\s+работников.*охран[аеы]\s+труда",
-        r"программа\s+обучения",
-        r"программа\s+повышения\s+квалификации",
-        r"переподготовка",
-        r"повышение\s+квалификации",
-        r"профессиональное\s+обучение",
-        r"\bслушатели\b",
-        r"протоколы\s+обучения",
-        r"\bудостоверение\b",
-        r"\bинструктаж\b",
-        r"\bстажировка\b",
-    ]
-    for pattern in education_patterns:
-        if re.search(pattern, title_lower):
-            return "education"
-
-    # OPR — целое слово "опр" или фразы
-    opr_patterns = [
-        r"\bопр\b",
-        r"оценка\s+профессиональных\s+рисков",
-        r"профессиональный\s+риск",
-        r"проф\.\s*риск",
-        r"профриск",
-        r"мероприятия\s+по\s+снижению\s+рисков",
-        r"идентификация\s+опасностей",
-    ]
-    for pattern in opr_patterns:
-        if re.search(pattern, title_lower):
-            return "opr"
-
-    # PLK
-    plk_patterns = [
-        r"производственн[а-я]*\s+контроль",
-        r"\bплк\b",
-        r"лабораторные\s+исследования",
-        r"лабораторный\s+контроль",
-        r"замеры\s+шума",
-        r"замеры\s+вибрации",
-        r"санитарно-гигиенические\s+исследования",
-    ]
-    for pattern in plk_patterns:
-        if re.search(pattern, title_lower):
-            return "plk"
-
-    return ""
-
-
 def _build_tender_text(detail, documents_text: str) -> str:
+    """Строит структурированный текст тендера для LLM."""
     parts = [
         f"НАЗВАНИЕ ЗАКУПКИ: {detail.purchase_name or detail.tender_id}",
         f"ЗАКАЗЧИК: {detail.customer_name or 'не указан'}",
@@ -336,10 +254,7 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     needs_manual = getattr(analysis, "needs_manual_review", False)
     llm_conf = getattr(analysis, "llm_confidence", 0.0)
 
-    if hasattr(analysis, "_format_comment"):
-        comment_for_sheets = analysis._format_comment()
-    else:
-        comment_for_sheets = analysis.comment
+    comment_for_sheets = analysis.comment
 
     return {
         "ID тендера": tender.tender_id,
@@ -349,7 +264,9 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         "НМЦК": _format_nmck((detail.nmck if detail else 0) or analysis.nmck),
         "Ссылка на тендер": tender_url,
         "ЭТП": detail.platform_name if detail else (tender.etp or ""),
-        "Регион": detail.customer_region if detail else (tender.region or ""),
+        "Регион": (
+            detail.customer_region if detail else (getattr(tender, "region", "") or "")
+        ),
         "Обеспечение заявки": app_guarantee,
         "Обеспечение контракта": contract_guarantee,
         "Способ обеспечения исполнения": guarantee_method,
@@ -390,7 +307,7 @@ def run_parse_only(max_pages: int = None, max_results: int = None):
 def run_analyze(
     max_pages: int = None, max_results: int = None, skip_detail: bool = False
 ):
-    """Полный анализ с LLM."""
+    """Полный анализ с LLM. v7.0.0: type_hint только через TypeService."""
     logger.info("=" * 60)
     logger.info("🤖 РЕЖИМ: Полный анализ с LLM")
     logger.info("=" * 60)
@@ -430,7 +347,6 @@ def run_analyze(
             logger.info("📄 DetailedParser инициализирован с session_manager")
         except Exception as e:
             logger.warning(f"⚠️ DetailedParser не инициализирован: {e}")
-            logger.warning("   Будет использоваться упрощённый анализ (только title)")
 
     sheets_manager = None
     sheets_enabled = getattr(settings, "GOOGLE_SHEETS_ENABLED", True)
@@ -442,7 +358,6 @@ def run_analyze(
             logger.info("📊 Google Sheets подключен")
         except Exception as e:
             logger.warning(f"⚠️ Google Sheets не подключен: {e}")
-            logger.warning("   Тендеры будут сохранены только в CSV/JSON")
     else:
         logger.info("📊 Google Sheets отключен в настройках")
 
@@ -461,9 +376,7 @@ def run_analyze(
         detail = None
         documents_text = ""
         tender_text = ""
-        logger.info(
-            f"[DEBUG] tender.title='{tender.title}', tender.region='{getattr(tender, 'region', 'N/A')}', tender.customer='{getattr(tender, 'customer', 'N/A')}'"
-        )
+
         # === ШАГ 1: Детальный парсинг ===
         if detailed and not skip_detail:
             try:
@@ -490,7 +403,7 @@ def run_analyze(
                         f"   🔒 Обеспечение: {detail.application_guarantee or 'не указано'}"
                     )
 
-                    # === Обработка документов через DocumentProcessor ===
+                    # Обработка документов через DocumentProcessor
                     documents_text = ""
                     if detail.documents:
                         try:
@@ -537,6 +450,11 @@ def run_analyze(
 
         # === ШАГ 2: Fallback — упрощённый текст ===
         if not tender_text:
+            # v7.0.0: включаем documents_text даже в fallback
+            doc_part = ""
+            if documents_text and len(documents_text) > 100:
+                doc_part = f"\n\nТЕКСТ ДОКУМЕНТОВ:\n{documents_text[:12000]}"
+
             tender_text = f"""НАЗВАНИЕ ЗАКУПКИ:
 {tender.title}
 
@@ -544,14 +462,13 @@ def run_analyze(
 {tender.customer or 'не указан'}
 
 РЕГИОН:
-{tender.region or 'не указан'}
+{getattr(tender, 'region', '') or 'не указан'}
 
 НМЦК:
 {tender.nmck or 'не указана'}
 
 ЗАКОН:
-{tender.law}
-"""
+{tender.law}{doc_part}"""
             logger.info("   ℹ️ Используется упрощённый текст (title only)")
 
         # === ШАГ 3: LLM-анализ ===
@@ -561,8 +478,12 @@ def run_analyze(
                 tender_info = {
                     "purchase_name": detail.purchase_name or tender.title,
                     "customer_name": detail.customer_name or tender.customer or "",
-                    "customer_region": detail.customer_region or tender.region or "",
-                    "region": detail.customer_region or tender.region or "",
+                    "customer_region": detail.customer_region
+                    or getattr(tender, "region", "")
+                    or "",
+                    "region": detail.customer_region
+                    or getattr(tender, "region", "")
+                    or "",
                     "nmck": detail.nmck or tender.nmck or 0,
                     "deadline_date": detail.deadline_date or tender.deadline_date or "",
                     "deadline_days": _parse_deadline_to_days(
@@ -580,41 +501,13 @@ def run_analyze(
                 tender_info["cities_count"] = detail.cities_count or 1
                 tender_info["regions_count"] = detail.regions_count or 1
                 tender_info["addresses_count"] = detail.addresses_count or 1
-
-                # === v6.9.1: Годовой тендер ===
                 tender_info["is_annual"] = bool(getattr(detail, "is_annual", False))
 
-                # === v6.9.1: Region для EducationCalculator (аренда помещения) ===
                 if not tender_info.get("region"):
                     tender_info["region"] = (
-                        tender_info.get("customer_region", "") or tender.region or ""
-                    )
-
-                tender_type_lower = (detail.tender_type_hint or "").lower()
-                is_sout = tender_type_lower in (
-                    "sout",
-                    "combined",
-                    "соут",
-                    "комбинированный",
-                )
-
-                if not tender_type_lower:
-                    name_lower = (detail.purchase_name or "").lower()
-                    is_sout = any(
-                        kw in name_lower
-                        for kw in [
-                            "соут",
-                            "специальная оценка условий труда",
-                            "оценка условий труда",
-                            "оценка рабочих мест",
-                            "специальная оценка",
-                        ]
-                    )
-
-                if is_sout:
-                    logger.info(
-                        f"[v6.8.5] СОУТ/combined: cities={detail.cities_count}, "
-                        f"regions={detail.regions_count}, addresses={detail.addresses_count}"
+                        tender_info.get("customer_region", "")
+                        or getattr(tender, "region", "")
+                        or ""
                     )
 
                 if detail.tender_type_hint == "education":
@@ -654,16 +547,13 @@ def run_analyze(
                     detail, "needs_subcontractor", False
                 )
 
-            # <- Fallback тип из title, если detail не дал тип
+            # v7.0.0: type_hint ТОЛЬКО из detail (DetailedParser уже использует TypeService)
+            # Убран _detect_type_from_title() — дубль TypeService
             type_hint = detail.tender_type_hint if detail else None
-            if not type_hint and tender.title:
-                type_hint = _detect_type_from_title(tender.title)
-                if type_hint:
-                    logger.info(f"[v6.8.5] Тип определён по title: {type_hint}")
 
             logger.info(
                 f"[DEBUG] Passing to analyzer: nmck={tender.nmck}, "
-                f"region={detail.customer_region if detail else tender.region}, "
+                f"region={tender_info.get('region', 'N/A')}, "
                 f"text_length={len(tender_text)}, "
                 f"students_count={tender_info.get('students_count', 'N/A')}, "
                 f"rm_total={tender_info.get('rm_total', 'N/A')}, "
@@ -671,14 +561,11 @@ def run_analyze(
                 f"type_hint={type_hint}"
             )
 
-            classification = None
-            confidence = 0.0
-
             analysis = analyzer.analyze(
                 tender_info=tender_info,
                 documents_text=documents_text or tender_text,
-                llm_classification=classification,
-                llm_confidence=confidence,
+                llm_classification=None,
+                llm_confidence=0.0,
                 tender_type_hint=type_hint,
             )
 
@@ -874,7 +761,7 @@ def run_interactive():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TENDER-BOT v2: Анализ тендеров с ИИ",
+        description="TENDER-BOT v7.0.0: Анализ тендеров с ИИ",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Примеры:

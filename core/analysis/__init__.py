@@ -5,14 +5,12 @@ core/analysis/__init__.py
 
 from core.analysis.analyzer import TenderAnalyzer
 from core.analysis.result import AnalysisResult
-from core.analysis.type_resolver import TypeResolver
 from core.analysis.guard_engine import GuardEngine
 from core.analysis.calculator_router import CalculatorRouter
 
 __all__ = [
     "TenderAnalyzer",
     "AnalysisResult",
-    "TypeResolver",
     "GuardEngine",
     "CalculatorRouter",
 ]
