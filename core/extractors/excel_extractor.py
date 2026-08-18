@@ -135,7 +135,7 @@ class ExcelExtractor(BaseExtractor):
                 continue
 
             # Определяем заголовки (первые непустые строки)
-            if row_idx == 0 or (row_idx < 5 and not headers):
+            if row_idx == 0 or (row_idx < 10 and not headers):
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
@@ -230,7 +230,7 @@ class ExcelExtractor(BaseExtractor):
                 continue
 
             # Определяем заголовки (первые непустые строки)
-            if row_idx == 0 or (row_idx < 5 and not headers):
+            if row_idx == 0 or (row_idx < 10 and not headers):
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)

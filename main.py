@@ -560,7 +560,17 @@ def run_analyze(
                 f"regions_count={tender_info.get('regions_count', 'N/A')}, "
                 f"type_hint={type_hint}"
             )
+            # v7.1.0: Проверка search title на ОПР/testing ДО передачи в analyzer
+            if not type_hint and tender.title:
+                from core.services.type_service import TypeService
 
+                _ts = TypeService()
+                _title_lower = tender.title.lower()
+                for _ttype, _keywords in _ts.TITLE_KEYWORDS.items():
+                    if any(_kw in _title_lower for _kw in _keywords):
+                        type_hint = _ttype
+                        logger.info(f"[v7.1.0] Type hint из search title: {_ttype}")
+                        break
             analysis = analyzer.analyze(
                 tender_info=tender_info,
                 documents_text=documents_text or tender_text,
