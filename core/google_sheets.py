@@ -39,18 +39,18 @@ SHEET_COLUMNS = [
     "Обеспечение контракта",  # J
     "Способ обеспечения исполнения",  # K
     "Срок подачи заявки до",  # L
-    "Решение по участию",  # M ← ручное, бот НЕ заполняет
+    "Решение по участию",  # M
     "Цена предложения",  # N
-    "Результат",  # O ← ручное, бот НЕ заполняет
-    "Дата заключения контракта",  # P ← ручное, бот НЕ заполняет
-    "Дата выполнения работ",  # Q ← ручное, бот НЕ заполняет
+    "Результат",  # O
+    "Дата заключения контракта",  # P
+    "Дата выполнения работ",  # Q
     "Комментарий от ИИ-агента",  # R
     "Ручная проверка",  # S
     "Уверенность ИИ",  # T
-    "Комиссия ЭТП",  # V
-    "Возможности экономии",  # W
-    "Рекомендации",  # X
-    "Комментарии руководителя отдела по участию",  # U ← v6.5: новая, ручная
+    "Комиссия ЭТП",  # U
+    "Возможности экономии",  # V
+    "Рекомендации",  # W
+    "Комментарии руководителя отдела по участию",  # X
 ]
 
 # ← v6.0: Расширен диапазон с A:N до A:T (20 колонок)
@@ -290,7 +290,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:U{row_number}",
+                f"A{row_number}:X{row_number}",  # ← до X (24 колонки)
                 {"backgroundColor": {"red": 0.95, "green": 0.8, "blue": 0.8}},
             )
         except Exception as e:
@@ -300,7 +300,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:U{row_number}",
+                f"A{row_number}:X{row_number}",
                 {"backgroundColor": {"red": 0.8, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
@@ -310,7 +310,7 @@ class GoogleSheetsManager:
         try:
             # ← v6.0: Расширен диапазон до T
             self.worksheet.format(
-                f"A{row_number}:U{row_number}",
+                f"A{row_number}:X{row_number}",
                 {"backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8}},
             )
         except Exception as e:
