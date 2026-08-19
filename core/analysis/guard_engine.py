@@ -102,4 +102,27 @@ class GuardEngine:
                     f"при confidence={confidence} (source={source}) -> обнулены"
                 )
 
+        # Guard 4: Запрещённые направления (не наш профиль)
+        FORBIDDEN_KEYWORDS = [
+            "поставка сиз",
+            "поставка средств индивидуальной защиты",
+            "поставка спецодежды",
+            "поставка обуви",
+            "поставка касок",
+            "поставка перчаток",
+            "сзз",
+            "санитарно-защитная зона",
+            "проект сзз",
+        ]
+
+        purchase_name = info.get("purchase_name", "").lower()
+        for kw in FORBIDDEN_KEYWORDS:
+            if kw in purchase_name:
+                guards.append(f"Запрещённое направление: '{kw}' в названии")
+                logger.warning(
+                    f"[{self.VERSION}] GUARD: Запрещённое направление '{kw}' → не участвуем"
+                )
+                info["_forbidden_direction"] = True
+                break
+
         return info, guards

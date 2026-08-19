@@ -63,12 +63,18 @@ class SoutCalculator:
             delivery_count, is_annual
         )  # уже учитывает is_annual
 
-        # === Командировочные (годовые — те же, не ×12) ===
+        # === Командировочные (v7.2.0: годовые — тоже ×12) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
             self._calc_travel(
                 trip_days, regions_count, transport_cost, is_seasonal, cities_count
             )
         )
+        # Годовой тендер: командировочные повторяются каждый месяц
+        if is_annual:
+            travel_cost_auto *= annual_mult
+            measurer_and_daily *= annual_mult
+            accommodation_cost_auto *= annual_mult
+            flight_cost *= annual_mult
 
         # === Итого ===
         cost_price = (
