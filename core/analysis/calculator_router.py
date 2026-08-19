@@ -7,6 +7,9 @@ core/analysis/calculator_router.py
 - _calc_education теперь передаёт region в calculate_education()
 - _calc_combined передаёт documents_text и region
 - _calc_opr передаёт opr_positions/opr_persons корректно
+
+ИСПРАВЛЕНО (v7.1.0):
+- testing маршрутизируется на PLK-калькулятор (ближайший аналог)
 """
 
 from typing import Dict, Any
@@ -23,7 +26,7 @@ class CalculatorRouter:
     Делегирует вычисления TenderCalculator в зависимости от типа.
     """
 
-    VERSION = "v6.9.0"
+    VERSION = "v7.1.0"
 
     def __init__(self, calculator: TenderCalculator):
         self.calculator = calculator
@@ -36,7 +39,7 @@ class CalculatorRouter:
 
         Args:
             tender_info: Параметры тендера
-            tender_type: Тип (sout | education | opr | plk | combined)
+            tender_type: Тип (sout | education | opr | plk | testing | combined)
             documents_text: Текст документов (для education)
 
         Returns:
@@ -48,7 +51,12 @@ class CalculatorRouter:
             return self._calc_education(tender_info, documents_text)
         elif tender_type == "opr":
             return self._calc_opr(tender_info)
-        elif tender_type == "plk":
+        elif tender_type in ("plk", "testing"):
+            # v7.1.0: testing использует PLK-калькулятор как ближайший аналог
+            if tender_type == "testing":
+                logger.info(
+                    f"[{self.VERSION}] Testing → маршрутизация на PLK-калькулятор"
+                )
             return self._calc_plk(tender_info)
         elif tender_type == "combined":
             return self._calc_combined(tender_info, documents_text)
@@ -72,7 +80,7 @@ class CalculatorRouter:
             trip_days=info.get("trip_days", 3),
             rm_with_iii=info.get("rm_with_iii", 0),
             is_seasonal=info.get("is_seasonal", False),
-            is_annual=info.get("is_annual", False),  # <-- v6.9.1
+            is_annual=info.get("is_annual", False),
             transport_cost=info.get("transport_cost", 0),
         )
 
@@ -88,7 +96,6 @@ class CalculatorRouter:
 
         doc_types = self._detect_education_docs(info, documents_text)
 
-        # v6.9.0: Передаём region для корректного расчёта аренды
         region = info.get("region", "") or info.get("customer_region", "")
 
         return self.calculator.calculate_education(
@@ -104,7 +111,7 @@ class CalculatorRouter:
             manikin_days=info.get("manikin_days", 0),
             delivery_count=info.get("delivery_count", 1),
             region=region,
-            is_annual=info.get("is_annual", False),  # <-- v6.9.1
+            is_annual=info.get("is_annual", False),
             tender_text=documents_text,
             needs_manual_review=info.get("needs_manual_review", False),
             review_reason=info.get("review_reason", ""),
@@ -120,14 +127,12 @@ class CalculatorRouter:
         text_lower = text.lower()
         students = info.get("students_count", 0)
 
-        # Критическое правило: обучение охране труда -> протоколы
         if "охрана труда" in text_lower or "обучение по охране труда" in text_lower:
             logger.info(
                 f"[{self.VERSION}] Обнаружено обучение ОТ -> protocols={students}"
             )
             return {"protocols": students, "qual_certs": 0, "diplomas": 0}
 
-        # Проверяем явно указанные в tender_info
         protocols = info.get("protocols_count", 0)
         qual_certs = info.get("qual_certs", 0)
         diplomas = info.get("diplomas", 0)
@@ -139,11 +144,9 @@ class CalculatorRouter:
                 "diplomas": diplomas,
             }
 
-        # Авто-определение по ключевым словам
         if "переподготовка" in text_lower or "повышение квалификации" in text_lower:
             return {"protocols": 0, "qual_certs": students, "diplomas": 0}
 
-        # По умолчанию: протоколы
         return {"protocols": students, "qual_certs": 0, "diplomas": 0}
 
     # ==================== ОПР ====================
@@ -154,7 +157,6 @@ class CalculatorRouter:
         persons = info.get("opr_persons", 0)
 
         if not positions and not persons:
-            # Fallback: используем rm_total как opr_positions
             if info.get("rm_total"):
                 positions = info["rm_total"]
                 logger.info(
@@ -200,10 +202,6 @@ class CalculatorRouter:
     ) -> CalculationResult:
         """
         Расчёт комбинированного тендера (СОУТ + обучение).
-
-        v6.9.0:
-        - Передаёт documents_text и region в _calc_education
-        - Рассчитывает реальную маржу вместо хардкода
         """
         total_cost = 0.0
         total_recommended = 0.0

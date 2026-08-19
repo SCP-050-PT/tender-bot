@@ -116,7 +116,8 @@ class ExcelExtractor(BaseExtractor):
         self, sheet, doc_name: str
     ) -> Tuple[List[str], List[int]]:
         """Обрабатывает один лист XLSX. Возвращает (тексты, количества).
-        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК."""
+        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК.
+        v7.2.0: Пропускает merged cells (все значения одинаковые)."""
         sheet_texts = []
         extracted_quantities = []
         headers = []
@@ -127,22 +128,52 @@ class ExcelExtractor(BaseExtractor):
 
         for row_idx, row in enumerate(sheet.iter_rows()):
             row_values = [
-                str(cell.value) if cell.value is not None else "" for cell in row
+                str(cell.value) if cell.value is not None else ""
+                for cell in row
             ]
             row_text = [v for v in row_values if v.strip()]
 
             if not row_text:
                 continue
 
-            # Определяем заголовки (первые непустые строки)
-            if row_idx == 0 or (row_idx < 10 and not headers):
+            # v7.2.0: Пропускаем merged cells (все значения одинаковые)
+            if row_idx == 0 or (row_idx < 15 and not headers):
+                unique_values = set(v.lower().strip() for v in row_values if v.strip())
+                
+                # Пропускаем merged cells (1 уникальное значение)
+                if len(unique_values) <= 1:
+                    continue
+                
+                # Проверяем, содержит ли строка ключевые слова заголовков
+                row_lower = " ".join(v.lower() for v in row_values)
+                has_header_keywords = any(
+                    kw in row_lower 
+                    for kw in ["наименование", "кол-во", "количество", "цена", 
+                               "окпд", "единица", "№", "номер"]
+                )
+                
+                if not has_header_keywords:
+                    # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
+                    continue
+                
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
-                logger.debug(
-                    f"[ExcelExtractor] Заголовки: qty_col={quantity_col_idx}, "
-                    f"svc_col={service_col_idx}, price_col={unit_price_col_idx}"
+                logger.info(
+                    f"[ExcelExtractor] Заголовки на строке {row_idx}: "
+                    f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
+                )
+                continue
+
+                headers = [v.lower().strip() for v in row_values]
+                quantity_col_idx = self._find_quantity_column(headers)
+                service_col_idx = self._find_service_column(headers)
+                unit_price_col_idx = self._find_unit_price_column(headers)
+                logger.info(
+                    f"[ExcelExtractor] Заголовки найдены на строке {row_idx}: "
+                    f"qty_col={quantity_col_idx}, svc_col={service_col_idx}, "
+                    f"price_col={unit_price_col_idx}"
                 )
                 continue
 
@@ -210,13 +241,14 @@ class ExcelExtractor(BaseExtractor):
 
     def _process_sheet_xlrd(self, sheet, doc_name: str) -> Tuple[List[str], List[int]]:
         """Обрабатывает один лист XLS.
-        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК."""
+        v7.1.0: Также извлекает цену за единицу из обоснований НМЦК.
+        v7.2.0: Пропускает merged cells."""
         sheet_texts = []
         extracted_quantities = []
         headers = []
         quantity_col_idx = -1
         service_col_idx = -1
-        unit_price_col_idx = -1  # v7.1.0
+        unit_price_col_idx = -1
         is_nmck_file = self._is_nmck_file(doc_name)
 
         for row_idx in range(sheet.nrows):
@@ -229,31 +261,57 @@ class ExcelExtractor(BaseExtractor):
             if not row_text:
                 continue
 
-            # Определяем заголовки (первые непустые строки)
-            if row_idx == 0 or (row_idx < 10 and not headers):
+            # v7.2.0: Пропускаем merged cells (все значения одинаковые)
+            if row_idx == 0 or (row_idx < 15 and not headers):
+                unique_values = set(v.lower().strip() for v in row_values if v.strip())
+                
+                # Пропускаем merged cells (1 уникальное значение)
+                if len(unique_values) <= 1:
+                    continue
+                
+                # Проверяем, содержит ли строка ключевые слова заголовков
+                row_lower = " ".join(v.lower() for v in row_values)
+                has_header_keywords = any(
+                    kw in row_lower 
+                    for kw in ["наименование", "кол-во", "количество", "цена", 
+                               "окпд", "единица", "№", "номер"]
+                )
+                
+                if not has_header_keywords:
+                    # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
+                    continue
+                
                 headers = [v.lower().strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
-                unit_price_col_idx = self._find_unit_price_column(headers)  # v7.1.0
-                logger.debug(
-                    f"[ExcelExtractor] XLS заголовки: qty_col={quantity_col_idx}, "
-                    f"svc_col={service_col_idx}, price_col={unit_price_col_idx}"
+                unit_price_col_idx = self._find_unit_price_column(headers)
+                logger.info(
+                    f"[ExcelExtractor] Заголовки на строке {row_idx}: "
+                    f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
                 )
                 continue
 
-            # Формируем строку с подписями заголовков
+                headers = [v.lower().strip() for v in row_values]
+                quantity_col_idx = self._find_quantity_column(headers)
+                service_col_idx = self._find_service_column(headers)
+                unit_price_col_idx = self._find_unit_price_column(headers)
+                logger.info(
+                    f"[ExcelExtractor] XLS заголовки на строке {row_idx}: "
+                    f"qty_col={quantity_col_idx}, svc_col={service_col_idx}, "
+                    f"price_col={unit_price_col_idx}"
+                )
+                continue
+
             enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
             if enriched_row:
                 sheet_texts.append(" | ".join(enriched_row))
 
-            # Ищем количество
             qty = self._extract_quantity_from_row(
                 row_values, headers, quantity_col_idx, service_col_idx, is_nmck_file
             )
             if qty is not None and qty not in extracted_quantities:
                 extracted_quantities.append(qty)
 
-            # v7.1.0: Извлекаем цену за единицу из обоснования НМЦК
             if is_nmck_file and unit_price_col_idx >= 0:
                 price = self._extract_unit_price_from_row(
                     row_values, unit_price_col_idx, service_col_idx

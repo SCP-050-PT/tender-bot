@@ -18,7 +18,7 @@ COEFFICIENTS = {
 class FallbackService:
     """Оценка параметров по НМЦК когда LLM/КТРУ не дали данных."""
 
-    VERSION = "v7.0.0"
+    VERSION = "v7.1.0"
 
     @staticmethod
     def apply(tender_info: Dict[str, Any], tender_type: str) -> Dict[str, Any]:
@@ -28,6 +28,20 @@ class FallbackService:
         """
         nmck = tender_info.get("nmck", 0)
         if nmck <= 0:
+            return tender_info
+
+        # v7.1.0: Testing — обрабатываем ДО проверки COEFFICIENTS,
+        # т.к. "testing" нет в словаре COEFFICIENTS
+        if tender_type == "testing":
+            if not tender_info.get("measurement_points"):
+                estimated_points = int(round(nmck / 170))
+                if estimated_points > 0:
+                    tender_info["measurement_points"] = estimated_points
+                    tender_info["measurement_points_source"] = "nmck_estimate_testing"
+                    logger.info(
+                        f"[{FallbackService.VERSION}] FALLBACK testing: "
+                        f"estimated_points={estimated_points} (НМЦК {nmck:,.0f} / 170)"
+                    )
             return tender_info
 
         coeff = COEFFICIENTS.get(tender_type)
@@ -132,17 +146,5 @@ class FallbackService:
                     f"estimated_positions={estimated} "
                     f"(НМЦК {nmck:,.0f} / {price_per_unit})"
                 )
-                
-        elif tender_type == "testing":
-            # Testing: используем коэффициент PLK как ближайший аналог
-            estimated_points = int(round(nmck / 170))
-            if estimated_points > 0:
-                tender_info["measurement_points"] = estimated_points
-                tender_info["measurement_points_source"] = "nmck_estimate_testing"
-                logger.info(
-                    f"[{FallbackService.VERSION}] FALLBACK testing: "
-                    f"estimated_points={estimated_points} (НМЦК {nmck:,.0f} / 170)"
-                )
-        return tender_info
 
-        
+        return tender_info
