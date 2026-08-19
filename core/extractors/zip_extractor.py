@@ -10,6 +10,8 @@ core/extractors/zip_extractor.py
   - Убрано:
     * Заглушки lambda по умолчанию (используем конфиг)
     * Хардкод приоритетов и паттернов контрактов
+
+v7.2.0: Добавлена поддержка .7z через py7zr
 """
 
 import re
@@ -23,21 +25,26 @@ from loguru import logger
 from core.config.document_config import FILE_PRIORITY, CONTRACT_PATTERNS
 from core.extractors.base_extractor import BaseExtractor
 
+try:
+    import py7zr
+
+    HAS_PY7ZR = True
+except ImportError:
+    HAS_PY7ZR = False
+
 
 class ZipExtractor(BaseExtractor):
-    """Единый экстрактор текста из ZIP-архивов."""
+    """Единый экстрактор текста из ZIP и 7z архивов."""
 
-    SUPPORTED_EXTENSIONS = ["zip"]
+    SUPPORTED_EXTENSIONS = ["zip", "7z"]
+
+    # v7.2.0: Расширения файлов внутри архива, которые мы умеем читать
+    READABLE_EXTENSIONS = {"docx", "doc", "xlsx", "xls", "pdf", "txt", "rtf"}
 
     def __init__(self, max_files: int = 3, max_depth: int = 2):
-        """
-        Args:
-            max_files: максимальное количество файлов для обработки
-            max_depth: максимальная глубина вложенности ZIP (v6.8.6-r1)
-        """
         super().__init__()
         self.max_files = max_files
-        self.max_depth = max_depth  # v6.8.6-r1: из core/documents/
+        self.max_depth = max_depth
         self._sub_extractors = {}
 
     def _get_sub_extractor(self, ext: str):
@@ -58,7 +65,7 @@ class ZipExtractor(BaseExtractor):
             elif ext == "zip":
                 self._sub_extractors[ext] = ZipExtractor(
                     max_files=self.max_files,
-                    max_depth=self.max_depth - 1,  # v6.8.6-r1: уменьшаем глубину
+                    max_depth=self.max_depth - 1,
                 )
             elif ext in ["txt", "rtf"]:
                 from core.extractors.text_extractor import TextExtractor
@@ -67,7 +74,14 @@ class ZipExtractor(BaseExtractor):
         return self._sub_extractors.get(ext)
 
     def extract(self, file_path: Path, doc_name: str = "") -> str:
-        """Распаковывает ZIP и извлекает текст из вложенных файлов."""
+        """Распаковывает ZIP/7z и извлекает текст из вложенных файлов."""
+
+        # v7.2.0: Маршрутизация по расширению
+        ext = file_path.suffix.lower().lstrip(".")
+        if ext == "7z":
+            return self._extract_7z(file_path, doc_name)
+
+        # Оригинальная логика для ZIP
         if self.max_depth <= 0:
             logger.warning(
                 f"[ZipExtractor] Достигнут лимит глубины рекурсии: {doc_name}"
@@ -103,6 +117,73 @@ class ZipExtractor(BaseExtractor):
         result = "\n\n".join(texts)
         logger.info(f"[ZipExtractor] Извлечено: {len(result)} символов")
         return result
+
+    def _extract_7z(self, file_path: Path, doc_name: str = "") -> str:
+        """Распаковывает 7z архив через py7zr."""
+        if not HAS_PY7ZR:
+            logger.warning(
+                "[ZipExtractor] py7zr не установлен. " "Установите: pip install py7zr"
+            )
+            return ""
+
+        if self.max_depth <= 0:
+            logger.warning(
+                f"[ZipExtractor] Достигнут лимит глубины рекурсии: {doc_name}"
+            )
+            return ""
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="tender_7z_"))
+        texts = []
+
+        try:
+            with py7zr.SevenZipFile(file_path, mode="r") as sz:
+                sz.extractall(path=temp_dir)
+
+            # Собираем все файлы из распакованной директории
+            all_files = []
+            for f in temp_dir.rglob("*"):
+                if f.is_file():
+                    f_ext = f.suffix.lower().lstrip(".")
+                    if f_ext in self.READABLE_EXTENSIONS:
+                        all_files.append(f)
+
+            # Сортируем по приоритету (ТЗ первые, контракты последние)
+            all_files.sort(key=lambda f: self._get_file_priority(f.name), reverse=True)
+
+            for fpath in all_files[: self.max_files]:
+                try:
+                    text = self._extract_inner_file(fpath, fpath.name)
+                    if text:
+                        texts.append(f"=== ВЛОЖЕННЫЙ ФАЙЛ: {fpath.name} ===\n{text}")
+                except Exception as e:
+                    logger.warning(f"[ZipExtractor] 7z ошибка {fpath.name}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"[ZipExtractor] Ошибка 7z {doc_name}: {e}")
+            return ""
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        result = "\n\n".join(texts)
+        logger.info(
+            f"[ZipExtractor] 7z извлечено: {len(texts)} файлов, "
+            f"{len(result)} символов"
+        )
+        return result
+
+    def _extract_inner_file(self, file_path: Path, original_name: str) -> str:
+        """Извлекает текст из файла внутри 7z архива через суб-экстракторы."""
+        ext = file_path.suffix.lower().lstrip(".")
+        extractor = self._get_sub_extractor(ext)
+        if extractor:
+            text = extractor.extract(file_path, original_name)
+            logger.info(f"[ZipExtractor] 7z {original_name}: {len(text)} симв.")
+            return text
+        else:
+            from core.extractors.text_extractor import TextExtractor
+
+            return TextExtractor().extract(file_path, original_name)
 
     def _list_files(self, z: zipfile.ZipFile) -> List[str]:
         """Возвращает список файлов, исключая служебные."""
@@ -152,7 +233,6 @@ class ZipExtractor(BaseExtractor):
         self, z: zipfile.ZipFile, fname: str, ext: str, temp_dir: Path
     ) -> str:
         """Извлекает один файл из ZIP и обрабатывает его."""
-        # v6.8.6-r1: Декодирование с 3 кодировками (добавлен cp1251)
         decoded_fname = self._decode_filename(fname)
 
         safe_fname = re.sub(r"[^\w\-_.]", "_", decoded_fname)[:100]
@@ -161,7 +241,6 @@ class ZipExtractor(BaseExtractor):
         with z.open(fname) as src, open(extracted_path, "wb") as dst:
             dst.write(src.read())
 
-        # Определяем реальный тип по содержимому
         real_ext = ext
         if ext not in ["docx", "doc", "pdf", "xlsx", "xls", "txt", "rtf", "zip"]:
             real_ext = self._detect_by_content(extracted_path) or ext
@@ -177,10 +256,7 @@ class ZipExtractor(BaseExtractor):
             return TextExtractor().extract(extracted_path, decoded_fname)
 
     def _decode_filename(self, fname: str) -> str:
-        """Декодирует имя файла из ZIP.
-
-        v6.8.6-r1: Добавлен cp1251 (3 кодировки вместо 2).
-        """
+        """Декодирует имя файла из ZIP (3 кодировки: utf-8, cp866, cp1251)."""
         for encoding in ["utf-8", "cp866", "cp1251"]:
             try:
                 return fname.encode("cp437").decode(encoding)

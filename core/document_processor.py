@@ -80,6 +80,7 @@ class DocumentProcessor:
             "pdf": PdfExtractor(),
             "xlsx": ExcelExtractor(),
             "xls": ExcelExtractor(),
+            "7z": ZipExtractor(),
             "zip": ZipExtractor(),
             "txt": TextExtractor(),
             "rtf": TextExtractor(),
@@ -295,6 +296,8 @@ class DocumentProcessor:
             return ".zip"
         elif header.startswith(OLE2_MAGIC):
             return ".doc"
+        elif header.startswith(b"7z\xbc\xaf"):
+            return "7z"
         return ""
 
     def _validate_file_content(self, file_path: Path, file_type: str) -> bool:

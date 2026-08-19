@@ -330,6 +330,10 @@ class ExcelExtractor(BaseExtractor):
             if any(kw in h for kw in UNIT_PRICE_COLUMN_KEYWORDS):
                 logger.info(f"[ExcelExtractor] Колонка цены за ед.: '{h}' (idx {idx})")
                 return idx
+        # Временно INFO для диагностики
+        logger.info(
+            f"[ExcelExtractor] DEBUG price_col=-1. Заголовки: {headers[:20]}"
+        )
         return -1
 
     def _is_nmck_file(self, doc_name: str) -> bool:
@@ -385,10 +389,8 @@ class ExcelExtractor(BaseExtractor):
         except (ValueError, TypeError):
             return None
 
-        # Фильтр: отбрасываем явно нереалистичные значения
-        if qty <= 0 or qty > 10000:
-            return None
-            # Фильтр: если число > 1000 и рядом есть десятичные числа (цены) — пропуск
+        
+        # Фильтр: если число > 1000 и рядом есть десятичные числа (цены) — пропуск
         if qty > 1000 and quantity_col_idx >= 0:
             for adj_idx in range(
                 max(0, quantity_col_idx - 2), min(len(row_values), quantity_col_idx + 3)
@@ -401,6 +403,9 @@ class ExcelExtractor(BaseExtractor):
                         f"[ExcelExtractor] qty={qty} пропущено: похоже на цену"
                     )
                     return None
+        # Фильтр: отбрасываем явно нереалистичные значения
+        if qty <= 0 or qty > 10000:
+            return None
         # Если есть колонка услуги — проверяем ключевые слова
         if service_col_idx >= 0 and service_col_idx < len(row_values):
             service_str = str(row_values[service_col_idx]).lower()
