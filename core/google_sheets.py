@@ -47,11 +47,14 @@ SHEET_COLUMNS = [
     "Комментарий от ИИ-агента",  # R
     "Ручная проверка",  # S
     "Уверенность ИИ",  # T
+    "Комиссия ЭТП",  # V
+    "Возможности экономии",  # W
+    "Рекомендации",  # X
     "Комментарии руководителя отдела по участию",  # U ← v6.5: новая, ручная
 ]
 
 # ← v6.0: Расширен диапазон с A:N до A:T (20 колонок)
-BOT_COLUMNS_RANGE = "A:T"
+BOT_COLUMNS_RANGE = "A:X"
 
 
 @dataclass
@@ -331,9 +334,6 @@ class GoogleSheetsManager:
 
 
 _sheets_manager: Optional[GoogleSheetsManager] = None
-
-
-
 
 
 def get_sheets_manager() -> GoogleSheetsManager:

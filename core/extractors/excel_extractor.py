@@ -139,11 +139,11 @@ class ExcelExtractor(BaseExtractor):
             # v7.2.0: Пропускаем merged cells (все значения одинаковые)
             if row_idx == 0 or (row_idx < 15 and not headers):
                 unique_values = set(v.lower().strip() for v in row_values if v.strip())
-                
+
                 # Пропускаем merged cells (1 уникальное значение)
                 if len(unique_values) <= 1:
                     continue
-                
+
                 # Проверяем, содержит ли строка ключевые слова заголовков
                 row_lower = " ".join(v.lower() for v in row_values)
                 has_header_keywords = any(
@@ -151,29 +151,18 @@ class ExcelExtractor(BaseExtractor):
                     for kw in ["наименование", "кол-во", "количество", "цена", 
                                "окпд", "единица", "№", "номер"]
                 )
-                
+
                 if not has_header_keywords:
                     # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
                     continue
-                
-                headers = [v.lower().strip() for v in row_values]
+
+                headers = [re.sub(r"\s+", " ", v.lower()).strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
                 logger.info(
                     f"[ExcelExtractor] Заголовки на строке {row_idx}: "
                     f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
-                )
-                continue
-
-                headers = [v.lower().strip() for v in row_values]
-                quantity_col_idx = self._find_quantity_column(headers)
-                service_col_idx = self._find_service_column(headers)
-                unit_price_col_idx = self._find_unit_price_column(headers)
-                logger.info(
-                    f"[ExcelExtractor] Заголовки найдены на строке {row_idx}: "
-                    f"qty_col={quantity_col_idx}, svc_col={service_col_idx}, "
-                    f"price_col={unit_price_col_idx}"
                 )
                 continue
 
@@ -264,11 +253,11 @@ class ExcelExtractor(BaseExtractor):
             # v7.2.0: Пропускаем merged cells (все значения одинаковые)
             if row_idx == 0 or (row_idx < 15 and not headers):
                 unique_values = set(v.lower().strip() for v in row_values if v.strip())
-                
+
                 # Пропускаем merged cells (1 уникальное значение)
                 if len(unique_values) <= 1:
                     continue
-                
+
                 # Проверяем, содержит ли строка ключевые слова заголовков
                 row_lower = " ".join(v.lower() for v in row_values)
                 has_header_keywords = any(
@@ -276,29 +265,18 @@ class ExcelExtractor(BaseExtractor):
                     for kw in ["наименование", "кол-во", "количество", "цена", 
                                "окпд", "единица", "№", "номер"]
                 )
-                
+
                 if not has_header_keywords:
                     # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
                     continue
-                
-                headers = [v.lower().strip() for v in row_values]
+
+                headers = [re.sub(r"\s+", " ", v.lower()).strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
                 logger.info(
                     f"[ExcelExtractor] Заголовки на строке {row_idx}: "
                     f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
-                )
-                continue
-
-                headers = [v.lower().strip() for v in row_values]
-                quantity_col_idx = self._find_quantity_column(headers)
-                service_col_idx = self._find_service_column(headers)
-                unit_price_col_idx = self._find_unit_price_column(headers)
-                logger.info(
-                    f"[ExcelExtractor] XLS заголовки на строке {row_idx}: "
-                    f"qty_col={quantity_col_idx}, svc_col={service_col_idx}, "
-                    f"price_col={unit_price_col_idx}"
                 )
                 continue
 
@@ -410,7 +388,19 @@ class ExcelExtractor(BaseExtractor):
         # Фильтр: отбрасываем явно нереалистичные значения
         if qty <= 0 or qty > 10000:
             return None
-
+            # Фильтр: если число > 1000 и рядом есть десятичные числа (цены) — пропуск
+        if qty > 1000 and quantity_col_idx >= 0:
+            for adj_idx in range(
+                max(0, quantity_col_idx - 2), min(len(row_values), quantity_col_idx + 3)
+            ):
+                if adj_idx == quantity_col_idx:
+                    continue
+                adj_val = row_values[adj_idx].replace(" ", "").replace(",", ".")
+                if re.search(r"\d+\.\d{2}", adj_val):
+                    logger.debug(
+                        f"[ExcelExtractor] qty={qty} пропущено: похоже на цену"
+                    )
+                    return None
         # Если есть колонка услуги — проверяем ключевые слова
         if service_col_idx >= 0 and service_col_idx < len(row_values):
             service_str = str(row_values[service_col_idx]).lower()

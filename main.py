@@ -281,6 +281,13 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         "Комментарии руководителя отдела по участию": comment_for_sheets,
         "Ручная проверка": "ДА" if needs_manual else "НЕТ",
         "Уверенность ИИ": f"{llm_conf:.2f}" if llm_conf > 0 else "",
+        "Комиссия ЭТП": (
+            f"{analysis.details.get('etp_commission', 0):,.0f} ₽"
+            if analysis.details
+            else ""
+        ),
+        "Возможности экономии": "",  # заполняется менеджером вручную
+        "Рекомендации": analysis.comment[:200] if analysis.comment else "",
     }
 
 
