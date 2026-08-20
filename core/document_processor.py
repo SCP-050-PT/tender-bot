@@ -20,6 +20,8 @@ from loguru import logger
 
 from core.config.document_config import (
     CONTRACT_PATTERNS,
+    SKIP_FILE_PATTERNS,
+    EXCEL_ONLY_PATTERNS,
     FILE_PRIORITY,
     MAX_TEXT_LENGTH,
     MAX_CONTRACT_FILE_SIZE,
@@ -95,6 +97,7 @@ class DocumentProcessor:
     ) -> str:
         """
         Обрабатывает список документов тендера.
+        v7.2.2: Фильтрация по чёрному списку + Excel-only файлы.
         Возвращает объединённый текст для анализа.
         """
         if not documents:
@@ -105,11 +108,29 @@ class DocumentProcessor:
         logger.info(f"[DocumentProcessor] Активных документов: {len(active_docs)}")
 
         # Классифицируем документы
+        skipped_docs = []
+        excel_only_docs = []
         for doc in active_docs:
             doc.is_contract = self._is_contract_file(doc.name)
             doc.priority = self._get_file_priority(doc.name)
+            
+            # v7.2.2: Чёрный список
+            if self._should_skip_file(doc.name):
+                skipped_docs.append(doc)
+                logger.info(f"[DocumentProcessor] Пропуск (чёрный список): {doc.name}")
+                continue
+            
+            # v7.2.2: Excel-only (извлекаем qty/price, но не в LLM)
+            if self._is_excel_only(doc.name):
+                excel_only_docs.append(doc)
+                logger.info(f"[DocumentProcessor] Excel-only: {doc.name}")
+                continue
+            
             if doc.is_contract:
                 logger.info(f"[DocumentProcessor] Контракт/договор: {doc.name}")
+
+        # Убираем пропущенные и excel-only из основного списка
+        active_docs = [d for d in active_docs if d not in skipped_docs and d not in excel_only_docs]
 
         # Сортируем: приоритетные первые, контракты в конце
         active_docs.sort(key=lambda d: (-d.priority, d.is_contract))
@@ -118,10 +139,28 @@ class DocumentProcessor:
 
         logger.info(
             f"[DocumentProcessor] Обработать: {len(docs_to_process)} "
-            f"(контрактов пропущено: {len(contract_docs)})"
+            f"(контрактов пропущено: {len(contract_docs)}, "
+            f"чёрный список: {len(skipped_docs)}, "
+            f"excel-only: {len(excel_only_docs)})"
         )
 
-        # Обрабатываем документы
+        # v7.2.2: Обрабатываем Excel-only файлы (только структурированные данные)
+        structured_parts = []
+        for doc in excel_only_docs:
+            try:
+                text = self._process_single_document(doc)
+                if text:
+                    # Только первые 500 символов (qty + price), не полный текст
+                    structured_parts.append(text[:2000])
+                    logger.info(
+                        f"[DocumentProcessor] Excel-only извлечено: {doc.name} "
+                        f"({min(len(text), 500)} симв.)"
+                    )
+            except Exception as e:
+                logger.error(f"[DocumentProcessor] Ошибка Excel-only {doc.name}: {e}")
+                continue
+
+        # Обрабатываем основные документы
         texts = []
         for doc in docs_to_process:
             try:
@@ -131,6 +170,10 @@ class DocumentProcessor:
             except Exception as e:
                 logger.error(f"[DocumentProcessor] Ошибка {doc.name}: {e}")
                 continue
+
+        # Добавляем структурированные данные из Excel-only
+        if structured_parts:
+            texts.append("=== ДАННЫЕ ИЗ ОБОСНОВАНИЯ НМЦК ===\n" + "\n".join(structured_parts))
 
         # Добавляем предупреждение о контрактах
         if contract_docs:
@@ -155,7 +198,26 @@ class DocumentProcessor:
             if re.search(pattern, name_lower, re.IGNORECASE):
                 return True
         return False
+    def _should_skip_file(self, filename: str) -> bool:
+        """v7.2.2: Проверяет, нужно ли пропустить файл (экономия токенов)."""
+        if not filename:
+            return False
+        name_lower = filename.lower()
+        for pattern in SKIP_FILE_PATTERNS:
+            if re.search(pattern, name_lower, re.IGNORECASE):
+                logger.debug(f"[DocumentProcessor] Пропуск (чёрный список): {filename}")
+                return True
+        return False
 
+    def _is_excel_only(self, filename: str) -> bool:
+        """v7.2.2: Файл только для Excel-извлечения, не для LLM."""
+        if not filename:
+            return False
+        name_lower = filename.lower()
+        for pattern in EXCEL_ONLY_PATTERNS:
+            if re.search(pattern, name_lower, re.IGNORECASE):
+                return True
+        return False
     def _get_file_priority(self, filename: str) -> int:
         """Определяет приоритет файла по названию."""
         if not filename:

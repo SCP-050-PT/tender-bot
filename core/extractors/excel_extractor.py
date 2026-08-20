@@ -6,6 +6,9 @@
   - Фильтрация фантомных чисел (телефоны, адреса)
 
 v7.1.0: Извлечение цены за единицу из обоснований НМЦК (openpyxl + xlrd)
+v7.2.0: Пропуск merged cells, нормализация headers, фильтр ложного qty,
+         ограничение поиска заголовков первыми 15 строками, убран spam-лог
+v7.2.1: sheet.nrows вместо sheet.max_row (xlrd), debug-лог только при price_col=-1
 """
 
 import re
@@ -82,6 +85,10 @@ class ExcelExtractor(BaseExtractor):
 
         return is_xlsx, is_xls
 
+    # ================================================================
+    # OPENPYXL (XLSX)
+    # ================================================================
+
     def _extract_structured_openpyxl(self, file_path: Path, doc_name: str) -> str:
         """Извлекает XLSX со структурированными данными."""
         try:
@@ -117,7 +124,9 @@ class ExcelExtractor(BaseExtractor):
     ) -> Tuple[List[str], List[int]]:
         """Обрабатывает один лист XLSX. Возвращает (тексты, количества).
         v7.1.0: Также извлекает цену за единицу из обоснований НМЦК.
-        v7.2.0: Пропускает merged cells (все значения одинаковые)."""
+        v7.2.0: Пропускает merged cells, нормализация headers,
+                 ограничение поиска заголовков первыми 15 строками.
+        """
         sheet_texts = []
         extracted_quantities = []
         headers = []
@@ -128,43 +137,66 @@ class ExcelExtractor(BaseExtractor):
 
         for row_idx, row in enumerate(sheet.iter_rows()):
             row_values = [
-                str(cell.value) if cell.value is not None else ""
-                for cell in row
+                str(cell.value) if cell.value is not None else "" for cell in row
             ]
             row_text = [v for v in row_values if v.strip()]
 
             if not row_text:
                 continue
 
-            # v7.2.0: Пропускаем merged cells (все значения одинаковые)
-            if row_idx == 0 or (row_idx < 15 and not headers):
+            # --- Поиск заголовков в первых 15 строках ---
+            if row_idx < 15 and not headers:
                 unique_values = set(v.lower().strip() for v in row_values if v.strip())
 
                 # Пропускаем merged cells (1 уникальное значение)
                 if len(unique_values) <= 1:
                     continue
 
-                # Проверяем, содержит ли строка ключевые слова заголовков
+                # Проверяем ключевые слова заголовков
                 row_lower = " ".join(v.lower() for v in row_values)
                 has_header_keywords = any(
-                    kw in row_lower 
-                    for kw in ["наименование", "кол-во", "количество", "цена", 
-                               "окпд", "единица", "№", "номер"]
+                    kw in row_lower
+                    for kw in [
+                        "наименование",
+                        "кол-во",
+                        "количество",
+                        "цена",
+                        "окпд",
+                        "единица",
+                        "№",
+                        "номер",
+                    ]
                 )
 
                 if not has_header_keywords:
-                    # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
                     continue
 
+                # Нормализация headers (убираем \n, лишние пробелы)
                 headers = [re.sub(r"\s+", " ", v.lower()).strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
                 logger.info(
                     f"[ExcelExtractor] Заголовки на строке {row_idx}: "
-                    f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
+                    f"qty={quantity_col_idx}, svc={service_col_idx}, "
+                    f"price={unit_price_col_idx}"
                 )
+                # Debug только если цена не найдена
+                if unit_price_col_idx == -1:
+                    logger.debug(
+                        f"[ExcelExtractor] price_col=-1. Заголовки: {headers[:20]}"
+                    )
                 continue
+
+            # После 15 строк без заголовков — прекращаем поиск
+            if row_idx >= 14 and not headers:
+                logger.debug(
+                    f"[ExcelExtractor] Заголовки не найдены в первых 15 строках, "
+                    f'пропускаем оставшиеся строки листа "{sheet.title}"'
+                )
+                break
+
+            # --- Обработка строк данных (заголовки уже найдены) ---
 
             # Формируем строку с подписями заголовков
             enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
@@ -178,7 +210,7 @@ class ExcelExtractor(BaseExtractor):
             if qty is not None and qty not in extracted_quantities:
                 extracted_quantities.append(qty)
 
-            # v7.1.0: Извлекаем цену за единицу из обоснования НМЦК
+            # Извлекаем цену за единицу из обоснования НМЦК
             if is_nmck_file and unit_price_col_idx >= 0:
                 price = self._extract_unit_price_from_row(
                     row_values, unit_price_col_idx, service_col_idx
@@ -197,6 +229,10 @@ class ExcelExtractor(BaseExtractor):
             sheet_texts.insert(0, f"=== ЛИСТ: {sheet.title} ===")
 
         return sheet_texts, extracted_quantities
+
+    # ================================================================
+    # XLRD (XLS)
+    # ================================================================
 
     def _extract_structured_xlrd(self, file_path: Path, doc_name: str) -> str:
         """Извлекает XLS со структурированными данными."""
@@ -231,7 +267,9 @@ class ExcelExtractor(BaseExtractor):
     def _process_sheet_xlrd(self, sheet, doc_name: str) -> Tuple[List[str], List[int]]:
         """Обрабатывает один лист XLS.
         v7.1.0: Также извлекает цену за единицу из обоснований НМЦК.
-        v7.2.0: Пропускает merged cells."""
+        v7.2.0: Пропускает merged cells, ограничение 15 строк.
+        v7.2.1: sheet.nrows вместо sheet.max_row (xlrd не имеет max_row).
+        """
         sheet_texts = []
         extracted_quantities = []
         headers = []
@@ -250,35 +288,60 @@ class ExcelExtractor(BaseExtractor):
             if not row_text:
                 continue
 
-            # v7.2.0: Пропускаем merged cells (все значения одинаковые)
-            if row_idx == 0 or (row_idx < 15 and not headers):
+            # --- Поиск заголовков в первых 15 строках ---
+            if row_idx < 15 and not headers:
                 unique_values = set(v.lower().strip() for v in row_values if v.strip())
 
                 # Пропускаем merged cells (1 уникальное значение)
                 if len(unique_values) <= 1:
                     continue
 
-                # Проверяем, содержит ли строка ключевые слова заголовков
+                # Проверяем ключевые слова заголовков
                 row_lower = " ".join(v.lower() for v in row_values)
                 has_header_keywords = any(
-                    kw in row_lower 
-                    for kw in ["наименование", "кол-во", "количество", "цена", 
-                               "окпд", "единица", "№", "номер"]
+                    kw in row_lower
+                    for kw in [
+                        "наименование",
+                        "кол-во",
+                        "количество",
+                        "цена",
+                        "окпд",
+                        "единица",
+                        "№",
+                        "номер",
+                    ]
                 )
 
                 if not has_header_keywords:
-                    # Строка с 2+ уникальными значениями, но без ключевых слов — пропускаем
                     continue
 
+                # Нормализация headers
                 headers = [re.sub(r"\s+", " ", v.lower()).strip() for v in row_values]
                 quantity_col_idx = self._find_quantity_column(headers)
                 service_col_idx = self._find_service_column(headers)
                 unit_price_col_idx = self._find_unit_price_column(headers)
                 logger.info(
                     f"[ExcelExtractor] Заголовки на строке {row_idx}: "
-                    f"qty={quantity_col_idx}, svc={service_col_idx}, price={unit_price_col_idx}"
+                    f"qty={quantity_col_idx}, svc={service_col_idx}, "
+                    f"price={unit_price_col_idx}"
                 )
+                # Debug только если цена не найдена
+                if unit_price_col_idx == -1:
+                    logger.debug(
+                        f"[ExcelExtractor] price_col=-1. Заголовки: {headers[:20]}"
+                    )
                 continue
+
+            # После 15 строк без заголовков — прекращаем поиск
+            # v7.2.1: sheet.nrows вместо sheet.max_row (xlrd не имеет max_row)
+            if row_idx >= 14 and not headers:
+                logger.debug(
+                    f"[ExcelExtractor] Заголовки не найдены в первых 15 строках, "
+                    f'пропускаем оставшиеся {sheet.nrows - 15} строк листа "{sheet.name}"'
+                )
+                break
+
+            # --- Обработка строк данных ---
 
             enriched_row = self._enrich_row(row_values, headers, quantity_col_idx)
             if enriched_row:
@@ -309,6 +372,10 @@ class ExcelExtractor(BaseExtractor):
 
         return sheet_texts, extracted_quantities
 
+    # ================================================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # ================================================================
+
     def _find_quantity_column(self, headers: List[str]) -> int:
         """Находит индекс колонки с количеством."""
         for idx, h in enumerate(headers):
@@ -325,15 +392,13 @@ class ExcelExtractor(BaseExtractor):
         return -1
 
     def _find_unit_price_column(self, headers: List[str]) -> int:
-        """Находит индекс колонки с ценой за единицу (v7.1.0)."""
+        """Находит индекс колонки с ценой за единицу (v7.1.0).
+        v7.2.1: Не логирует здесь — лог в вызывающем коде только при price_col=-1.
+        """
         for idx, h in enumerate(headers):
             if any(kw in h for kw in UNIT_PRICE_COLUMN_KEYWORDS):
                 logger.info(f"[ExcelExtractor] Колонка цены за ед.: '{h}' (idx {idx})")
                 return idx
-        # Временно INFO для диагностики
-        logger.info(
-            f"[ExcelExtractor] DEBUG price_col=-1. Заголовки: {headers[:20]}"
-        )
         return -1
 
     def _is_nmck_file(self, doc_name: str) -> bool:
@@ -370,6 +435,7 @@ class ExcelExtractor(BaseExtractor):
         """
         Извлекает количество из строки.
         Багфикс v6.6-r2: работает и без колонки услуги (для «Обоснования НМЦК»).
+        v7.2.0: Фильтр ложного qty (цена попала в колонку кол-во).
         """
         if quantity_col_idx < 0 or quantity_col_idx >= len(row_values):
             return None
@@ -389,8 +455,7 @@ class ExcelExtractor(BaseExtractor):
         except (ValueError, TypeError):
             return None
 
-        
-        # Фильтр: если число > 1000 и рядом есть десятичные числа (цены) — пропуск
+        # v7.2.0: Фильтр ложного qty — если > 1000 и рядом десятичные числа (цены)
         if qty > 1000 and quantity_col_idx >= 0:
             for adj_idx in range(
                 max(0, quantity_col_idx - 2), min(len(row_values), quantity_col_idx + 3)
@@ -403,9 +468,11 @@ class ExcelExtractor(BaseExtractor):
                         f"[ExcelExtractor] qty={qty} пропущено: похоже на цену"
                     )
                     return None
+
         # Фильтр: отбрасываем явно нереалистичные значения
         if qty <= 0 or qty > 10000:
             return None
+
         # Если есть колонка услуги — проверяем ключевые слова
         if service_col_idx >= 0 and service_col_idx < len(row_values):
             service_str = str(row_values[service_col_idx]).lower()

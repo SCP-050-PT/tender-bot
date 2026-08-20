@@ -17,7 +17,7 @@ import json
 import csv
 from pathlib import Path
 from datetime import datetime
-
+from core.daily_limiter import DailyLimiter
 # === ЛОГИРОВАНИЕ (ОДИН источник) ===
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
@@ -237,7 +237,7 @@ def _get_guarantee_info(detail, analysis) -> tuple:
 
 
 def _build_sheets_row(analysis, detail, tender) -> dict:
-    """Формирует строку для Google Sheets."""
+    """Формирует строку для Google Sheets. v7.2.1: новый порядок колонок + фиксы."""
     quantity = _get_quantity(analysis)
     app_guarantee, contract_guarantee, guarantee_method = _get_guarantee_info(
         detail, analysis
@@ -252,11 +252,33 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
     tender_url = tender.url
 
     needs_manual = getattr(analysis, "needs_manual_review", False)
-    llm_conf = getattr(analysis, "llm_confidence", 0.0)
 
-    comment_for_sheets = analysis.comment
+    # v7.2.1: ИИ-комментарий → колонка R (не X)
+    ai_comment = analysis.comment or ""
 
-    # === v7.2.0: Запрещённое направление — override решения ===
+    # v7.2.1: Наименование — приоритет tender.title, fallback detail.purchase_name (>10 символов)
+    purchase_name = tender.title or ""
+    if detail and detail.purchase_name and len(detail.purchase_name) > 10:
+        purchase_name = detail.purchase_name
+
+    # v7.2.1: ЭТП — 3 источника с правильным приоритетом
+    etp_name = ""
+    if detail:
+        etp_name = detail.platform_name or detail.etp or ""
+    if not etp_name and hasattr(tender, "etp") and tender.etp:
+        etp_name = tender.etp
+    elif detail and hasattr(detail, "etp") and detail.etp:
+        etp_name = detail.etp
+
+    # v7.2.1: Срок подачи — 2 источника
+    deadline = ""
+    if detail and detail.deadline_date:
+        deadline = detail.deadline_date
+    elif hasattr(tender, "deadline_date") and tender.deadline_date:
+        deadline = tender.deadline_date
+
+    # v7.2.0: Запрещённое направление — override решения
+    decision_override = analysis.decision
     if hasattr(analysis, "details") and analysis.details:
         details = analysis.details
         is_forbidden = (
@@ -264,45 +286,64 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         ) or getattr(details, "_forbidden_direction", False)
         if is_forbidden:
             decision_override = "не рекомендуется"
-            comment_for_sheets = "⛔ ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + comment_for_sheets
-        else:
-            decision_override = analysis.decision
-    else:
-        decision_override = analysis.decision
+            ai_comment = "⛔ ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + ai_comment
 
+    # v7.2.1: Новый порядок колонок A-W
     return {
-        "ID тендера": tender.tender_id,
-        "Наименование услуг": detail.purchase_name if detail else tender.title,
-        "Количество": quantity,
-        "Способ проведения закупки": procurement,
-        "НМЦК": _format_nmck((detail.nmck if detail else 0) or analysis.nmck),
-        "Ссылка на тендер": tender_url,
-        "ЭТП": detail.platform_name if detail else (tender.etp or ""),
-        "Регион": (
-            detail.customer_region if detail else (getattr(tender, "region", "") or "")
-        ),
-        "Обеспечение заявки": app_guarantee,
-        "Обеспечение контракта": contract_guarantee,
-        "Способ обеспечения исполнения": guarantee_method,
-        "Срок подачи заявки до": (
-            detail.deadline_date if detail else (tender.deadline_date or "")
-        ),
-        "Решение по участию": decision_override,
-        "Цена предложения": _format_price(analysis.recommended_price),
-        "Результат": "",
-        "Дата заключения контракта": "",
-        "Дата выполнения работ": "",
-        "Комментарии руководителя отдела по участию": comment_for_sheets,
-        "Ручная проверка": "ДА" if needs_manual else "НЕТ",
-        "Уверенность ИИ": f"{llm_conf:.2f}" if llm_conf > 0 else "",
-        "Комиссия ЭТП": (
+        "ID тендера": tender.tender_id,  # A
+        "Ссылка на тендер": tender_url,  # B
+        "Наименование услуг": purchase_name,  # C
+        "Способ проведения закупки": procurement,  # D
+        "ЭТП": etp_name,  # E
+        "Комиссия ЭТП": (  # F
             f"{analysis.details.get('etp_commission', 0):,.0f} ₽"
             if analysis.details
             else ""
         ),
-        "Возможности экономии": "",  # заполняется менеджером вручную
-        "Рекомендации": analysis.comment[:200] if analysis.comment else "",
+        "Регион": (  # G
+            detail.customer_region if detail else (getattr(tender, "region", "") or "")
+        ),
+        "Обеспечение заявки": app_guarantee,  # H
+        "Обеспечение контракта": contract_guarantee,  # I
+        "Способ обеспечения исполнения": guarantee_method,  # J
+        "Срок подачи заявки до": deadline,  # K
+        "НМЦК": _format_nmck((detail.nmck if detail else 0) or analysis.nmck),  # L
+        "Количество": quantity,  # M
+        "Цена предложения": _format_price(analysis.recommended_price),  # N
+        "Возможности экономии": "",  # O ← ручное
+        "Решение по участию": decision_override,  # Q
+        "Комментарий от ИИ-агента": ai_comment,  # R ← полный анализ ИИ
+        "Рекомендации": _build_short_recommendation(analysis),
+        "Комментарии руководителя отдела по участию": "",  # T ← ручное
+        "Дата заключения контракта": "",  # U ← ручное
+        "Дата выполнения работ": "",  # V ← ручное
+        "Результат": "",  # W ← ручное (в конце)
     }
+
+
+def _build_short_recommendation(analysis) -> str:
+    """Формирует краткую рекомендацию для колонки S."""
+    parts = []
+
+    # Тип тендера
+    parts.append(f"Тип: {analysis.tender_type}")
+
+    # Себестоимость и цена
+    parts.append(f"Себестоимость: {analysis.cost_price:,.0f} ₽")
+    parts.append(f"Рекомендуемая цена: {analysis.recommended_price:,.0f} ₽")
+    parts.append(f"Маржа: {analysis.margin_percent:.1f}%")
+
+    # Риск
+    risk_emoji = {"low": "🟢", "medium": "🟡", "high": "🔴"}.get(
+        analysis.risk_level, "⚪"
+    )
+    parts.append(f"Риск: {risk_emoji} {analysis.risk_level}")
+
+    # Нарушения лимитов
+    if hasattr(analysis, "guard_violations") and analysis.guard_violations:
+        parts.append(f"⚠️ {len(analysis.guard_violations)} нарушений лимитов")
+
+    return " | ".join(parts)
 
 
 def run_parse_only(max_pages: int = None, max_results: int = None):
@@ -331,6 +372,17 @@ def run_analyze(
     """Полный анализ с LLM. v7.0.0: type_hint только через TypeService."""
     logger.info("=" * 60)
     logger.info("🤖 РЕЖИМ: Полный анализ с LLM")
+    # === v7.2.2: Лимиты + очистка ===
+    limiter = DailyLimiter()
+    logger.info(limiter.get_status())
+
+    can_run, reason = limiter.can_run()
+    if not can_run:
+        logger.error(f"🚫 Запуск отменён: {reason}")
+        return [], []
+
+    # Очистка старых файлов
+    limiter.cleanup_all()
     logger.info("=" * 60)
 
     from config.settings import settings
@@ -614,7 +666,15 @@ def run_analyze(
 
             row = _build_sheets_row(analysis, detail, tender)
             sheets_rows.append(row)
+            # === v7.2.2: Кэш дубликатов (пропуск уже обработанных) ===
+            if limiter.is_cached(tender.tender_id):
+                logger.info(f"   ⏭️ Кэш: {tender.tender_id} уже обрабатывался, пропуск")
+                continue
 
+            # === v7.2.2: Лимит за запуск ===
+            if len(results) >= limiter.MAX_PER_RUN:
+                logger.info(f"   ⏹️ Лимит за запуск: {limiter.MAX_PER_RUN} тендеров")
+                break
             if sheets_manager:
                 try:
                     success = sheets_manager.add_tender_to_top(
@@ -707,6 +767,8 @@ def run_analyze(
         print(f"{'=' * 60}")
 
     logger.info(f"\n✅ Обработано тендеров: {len(results)}")
+    # === v7.2.2: Запись счётчиков ===
+    limiter.record_tenders(len(results))
     return results, sheets_rows
 
 

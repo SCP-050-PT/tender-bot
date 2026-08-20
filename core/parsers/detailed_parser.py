@@ -40,7 +40,7 @@ class DetailedParser:
         fallback_platform: str = "",
     ) -> Optional[TenderDetail]:
         self._last_notice_guid = None
-    
+
         law = law_type if "FZ" in law_type else f"{law_type}-FZ"
         law_clean = law.replace("-FZ", "")
 
@@ -257,6 +257,29 @@ class DetailedParser:
 
         # === НОВОЕ: Парсим документы из вкладки "Документы" ===
         documents = self._parse_documents(documents_html, law)
+                # === НОВОЕ: Парсим документы из вкладки "Документы" ===
+        documents = self._parse_documents(documents_html, law)
+
+        # v7.2.1: Парсим обеспечение заявки и контракта
+        warranty = self._extract_warranty(soup)
+
+        app_guarantee = ""
+        if warranty["app_required"]:
+            app_guarantee = f"{warranty['app_percent']:.1f}%" if warranty["app_percent"] > 0 else "Требуется"
+        elif warranty["app_text"]:
+            app_guarantee = warranty["app_text"]
+        else:
+            app_guarantee = "Не требуется"
+
+        contract_guarantee = ""
+        if warranty["contract_required"]:
+            contract_guarantee = f"{warranty['contract_percent']:.1f}%" if warranty["contract_percent"] > 0 else "Требуется"
+        elif warranty["contract_text"]:
+            contract_guarantee = warranty["contract_text"]
+        else:
+            contract_guarantee = "Не требуется"
+
+        guarantee_method = warranty["contract_method"] or "Не требуется"
 
         return TenderDetail(
             tender_id=tender_id,
@@ -269,8 +292,11 @@ class DetailedParser:
             publish_date=self._extract_publish_date(soup),
             deadline_date=self._extract_deadline(soup),
             requirements=self._extract_requirements(soup),
-            warranty_required=self._extract_warranty(soup)["required"],
-            warranty_percent=self._extract_warranty(soup)["percent"],
+            warranty_required=warranty["contract_required"],
+            warranty_percent=warranty["contract_percent"],
+            application_guarantee=app_guarantee,
+            contract_guarantee=contract_guarantee,
+            guarantee_method=guarantee_method,
             documents=documents,
             raw_html=html,
             notice_guid=self._last_notice_guid or self._extract_notice_guid(soup, law),
@@ -281,6 +307,7 @@ class DetailedParser:
             purchase_name=title,
             customer_name=self._extract_customer(soup),
             customer_region=region,
+            platform_name=self._extract_etp(soup),
             rm_total=ktru.get("rm_total", 0),
             students_count=ktru.get("students_count", 0),
             points_count=ktru.get("points_count", 0),
@@ -327,10 +354,31 @@ class DetailedParser:
         )
 
     def _extract_title(self, soup):
-        for sel in ["span.cardMainInfo__purchaseLink", "span.cardMainInfo__content"]:
-            el = soup.select_one(sel)
-            if el:
-                return el.get_text(strip=True)
+        """v7.2.1: Парсим 'Объект закупки' — надёжнее чем purchaseLink."""
+        # Способ 1: Ищем секцию "Объект закупки" (самый надёжный)
+        for section in soup.find_all("div", class_="cardMainInfo__section"):
+            title_span = section.find("span", class_="cardMainInfo__title")
+            if title_span and "объект закупки" in title_span.get_text().lower():
+                content_span = section.find("span", class_="cardMainInfo__content")
+                if content_span:
+                    text = content_span.get_text(strip=True)
+                    if text and len(text) > 5:
+                        return text
+
+        # Способ 2: Fallback на cardMainInfo__content (первый попавшийся)
+        for el in soup.select("span.cardMainInfo__content"):
+            text = el.get_text(strip=True)
+            # Пропускаем числа (НМЦК, даты)
+            if re.match(r'^[\d\s.,₽]+$', text):
+                continue
+            if text and len(text) > 10:
+                return text
+
+        # Способ 3: Последний fallback — purchaseLink (номер тендера)
+        el = soup.select_one("span.cardMainInfo__purchaseLink")
+        if el:
+            return el.get_text(strip=True)
+
         return ""
 
     def _extract_object_block(self, soup):
@@ -422,19 +470,60 @@ class DetailedParser:
         return ""
 
     def _extract_warranty(self, soup):
-        result = {"required": False, "percent": 0.0}
-        el = soup.find("span", string=re.compile("Обеспечение заявки", re.I))
-        if el:
-            parent = el.find_parent("div", class_="col-6")
-            if parent:
-                val = parent.find("span", class_="section__info")
+        """v7.2.1: Парсит обеспечение заявки И обеспечение контракта."""
+        result = {
+            "app_required": False,
+            "app_percent": 0.0,
+            "app_text": "",
+            "contract_required": False,
+            "contract_percent": 0.0,
+            "contract_text": "",
+            "contract_method": "",
+        }
+
+        # === Обеспечение заявки ===
+        for section in soup.find_all("section", class_="blockInfo__section"):
+            title = section.find("span", class_="section__title")
+            if not title:
+                continue
+            title_text = title.get_text(strip=True).lower()
+
+            if "обеспечение заявки" in title_text or "обеспечениe заявки" in title_text:
+                val = section.find("span", class_="section__info")
                 if val:
-                    text = val.get_text(strip=True).lower()
-                    if "требуется" in text or "да" in text:
-                        result["required"] = True
-                        m = re.search(r"(\d+(?:\.\d+)?)\s*%", text)
-                        if m:
-                            result["percent"] = float(m.group(1))
+                    text = val.get_text(strip=True)
+                    result["app_text"] = text
+                    text_lower = text.lower()
+                    if "требуется" in text_lower or "да" in text_lower:
+                        result["app_required"] = True
+                    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", text)
+                    if m:
+                        result["app_percent"] = float(m.group(1).replace(",", "."))
+
+            # === Обеспечение исполнения контракта ===
+            if "обеспечение исполнения контракта" in title_text and "размер" not in title_text and "порядок" not in title_text and "платеж" not in title_text:
+                val = section.find("span", class_="section__info")
+                if val:
+                    text = val.get_text(strip=True)
+                    result["contract_text"] = text
+                    text_lower = text.lower()
+                    if "да" in text_lower or "требуется" in text_lower:
+                        result["contract_required"] = True
+
+            if "размер обеспечения исполнения" in title_text:
+                val = section.find("span", class_="section__info")
+                if val:
+                    text = val.get_text(strip=True)
+                    m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", text)
+                    if m:
+                        result["contract_percent"] = float(m.group(1).replace(",", "."))
+                        result["contract_required"] = True
+
+            if "порядок предоставления обеспечения" in title_text:
+                val = section.find("span", class_="section__info")
+                if val:
+                    result["contract_method"] = val.get_text(strip=True)[:200]
+
         return result
 
     def _extract_notice_guid(self, soup, law):
