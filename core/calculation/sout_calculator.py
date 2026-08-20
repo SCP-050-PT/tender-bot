@@ -60,7 +60,9 @@ class SoutCalculator:
         # === Материалы и доставка ===
         materials_cost = self._calc_materials() * annual_mult
         delivery_cost = self._calc_delivery(
-            delivery_count, is_annual
+            delivery_count,
+            is_annual,
+            is_urgent=(trip_days <= 5 if trip_days else False),
         )  # уже учитывает is_annual
         # === Командировочные (v7.2.0: годовые — тоже ×12) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
@@ -198,10 +200,12 @@ class SoutCalculator:
             * self.costs["materials"]["ink_per_page"]["default_quantity"]
         )
 
-    def _calc_delivery(self, delivery_count: int, is_annual: bool) -> float:
-        """Расчёт доставки."""
+    def _calc_delivery(self, delivery_count: int, is_annual: bool, is_urgent: bool = False) -> float:
         actual_delivery = 12 if is_annual else delivery_count
-        return actual_delivery * self.costs["delivery"]["post_russia"]["cost"]
+        base_cost = self.costs["delivery"]["post_russia"]["cost"]
+        if is_urgent:
+            base_cost *= 2  # курьер вместо почты
+        return actual_delivery * base_cost
 
     def _calc_travel(
         self,

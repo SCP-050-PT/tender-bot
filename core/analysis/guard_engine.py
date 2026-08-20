@@ -125,5 +125,27 @@ class GuardEngine:
                 info["_forbidden_direction"] = True
                 break
 
+        # Guard 6: Признаки договорняка
+        SUSPICIOUS_PATTERNS = [
+            # НМЦК совпадает с ценой единственного поставщика
+            # (проверяется в main.py, не здесь)
+            # Слишком короткий срок подачи (< 3 дней для 44-ФЗ)
+            # (проверяется в main.py)
+            # Текст ТЗ содержит конкретное название бренда/модели
+            "торговая марка",
+            "товарный знак",
+            "конкретный производитель",
+            "единственный поставщик",
+        ]
 
+        purchase_name = info.get("purchase_name", "").lower()
+        documents_text = info.get("documents_text", "").lower()[:5000]
+
+        for pattern in SUSPICIOUS_PATTERNS:
+            if pattern in documents_text:
+                guards.append(f"Подозрение на договорняк: '{pattern}' в ТЗ")
+                logger.warning(
+                    f"[{self.VERSION}] GUARD: Подозрение на договорняк — '{pattern}' в ТЗ"
+                )
+                break
         return info, guards

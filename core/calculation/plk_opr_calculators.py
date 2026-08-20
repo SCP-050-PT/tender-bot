@@ -34,6 +34,7 @@ class PlkCalculator:
         distance_km: float = 0,
         transport_cost: float = 0,
         accommodation_cost: float = 0,
+        trip_days: int = 0,
     ) -> CalculationResult:
         """Расчёт цены для клиента на ПЛК.
         v6.9.1: Годовые тендеры — points_cost, measurer_cost, materials_cost ×12
@@ -58,7 +59,15 @@ class PlkCalculator:
         ) * annual_mult
 
         actual_delivery = 12 if is_annual else delivery_count
-        delivery_cost = actual_delivery * self.costs["delivery"]["post_russia"]["cost"]
+        base_delivery_cost = self.costs["delivery"]["post_russia"]["cost"]
+        # v7.2.0: Срочная доставка (срок < 5 дней) — курьер вместо почты, ×2
+        if trip_days and trip_days <= 5:
+            base_delivery_cost *= 2
+            logger.info(
+                f"[PlkCalc v7.2.0] Срочная доставка (trip_days={trip_days} ≤ 5): "
+                f"стоимость ×2 = {base_delivery_cost:,.0f}₽"
+            )
+        delivery_cost = actual_delivery * base_delivery_cost
 
         subcontractor_cost = (
             self.costs["subcontractor"]["default_cost"] if needs_subcontractor else 0
@@ -157,6 +166,7 @@ class OprCalculator:
         needs_dsiz_norms: bool = False,
         needs_iot_norms: bool = False,
         transport_cost: float = 0,
+        trip_days: int = 0,
     ) -> CalculationResult:
         """Расчёт цены для клиента на ОПР.
 
@@ -212,7 +222,15 @@ class OprCalculator:
         if needs_iot_norms:
             additional_cost += base_count * 200
 
-        delivery_cost = delivery_count * self.costs["delivery"]["post_russia"]["cost"]
+        base_delivery_cost = self.costs["delivery"]["post_russia"]["cost"]
+        # v7.2.0: Срочная доставка (срок < 5 дней) — курьер вместо почты, ×2
+        if trip_days and trip_days <= 5:
+            base_delivery_cost *= 2
+            logger.info(
+                f"[OprCalc v7.2.0] Срочная доставка (trip_days={trip_days} ≤ 5): "
+                f"стоимость ×2 = {base_delivery_cost:,.0f}₽"
+            )
+        delivery_cost = delivery_count * base_delivery_cost
 
         cost_price = (
             materials_cost

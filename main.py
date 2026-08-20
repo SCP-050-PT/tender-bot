@@ -256,6 +256,20 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
 
     comment_for_sheets = analysis.comment
 
+    # === v7.2.0: Запрещённое направление — override решения ===
+    if hasattr(analysis, "details") and analysis.details:
+        details = analysis.details
+        is_forbidden = (
+            isinstance(details, dict) and details.get("_forbidden_direction")
+        ) or getattr(details, "_forbidden_direction", False)
+        if is_forbidden:
+            decision_override = "не рекомендуется"
+            comment_for_sheets = "⛔ ЗАПРЕЩЁННОЕ НАПРАВЛЕНИЕ: " + comment_for_sheets
+        else:
+            decision_override = analysis.decision
+    else:
+        decision_override = analysis.decision
+
     return {
         "ID тендера": tender.tender_id,
         "Наименование услуг": detail.purchase_name if detail else tender.title,
@@ -273,7 +287,7 @@ def _build_sheets_row(analysis, detail, tender) -> dict:
         "Срок подачи заявки до": (
             detail.deadline_date if detail else (tender.deadline_date or "")
         ),
-        "Решение по участию": analysis.decision,
+        "Решение по участию": decision_override,
         "Цена предложения": _format_price(analysis.recommended_price),
         "Результат": "",
         "Дата заключения контракта": "",
