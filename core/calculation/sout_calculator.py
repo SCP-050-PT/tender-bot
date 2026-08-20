@@ -62,7 +62,6 @@ class SoutCalculator:
         delivery_cost = self._calc_delivery(
             delivery_count, is_annual
         )  # уже учитывает is_annual
-
         # === Командировочные (v7.2.0: годовые — тоже ×12) ===
         travel_cost_auto, measurer_and_daily, accommodation_cost_auto, flight_cost = (
             self._calc_travel(

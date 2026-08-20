@@ -125,4 +125,5 @@ class GuardEngine:
                 info["_forbidden_direction"] = True
                 break
 
+
         return info, guards

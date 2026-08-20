@@ -332,7 +332,6 @@ class GoogleSheetsManager:
             logger.error(f"Ошибка: {e}")
             return 1
 
-
 _sheets_manager: Optional[GoogleSheetsManager] = None
 
 
